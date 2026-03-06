@@ -40,7 +40,7 @@ final case class TombstoneRecord(
     propagateDeletes: Boolean,
 )
 
-final class InMemorySyncRepository extends SyncRepository:
+class InMemorySyncRepository extends SyncRepository:
   private var nextRunId: Long = 1L
   private var nextOrder: Long = 1L
 
@@ -137,6 +137,18 @@ final class InMemorySyncRepository extends SyncRepository:
     } else {
       observations += row
     }
+
+final class CountingSnapshotRepository extends InMemorySyncRepository:
+  var snapshotCallCount: Int = 0
+
+  override def recordRunSnapshot(
+      runId: Long,
+      pair: AlbumPair,
+      leftAssets: Seq[AssetResponseDto],
+      rightAssets: Seq[AssetResponseDto],
+  ): Unit =
+    snapshotCallCount += 1
+    super.recordRunSnapshot(runId, pair, leftAssets, rightAssets)
 
 final class FakeImmichApi extends ImmichApi:
   private val albumAssets: mutable.Map[(String, String), Seq[AssetResponseDto]] = mutable.Map.empty
@@ -351,4 +363,44 @@ class SyncSuite extends munit.FunSuite:
     assertEquals(error.getMessage, "boom")
     assertEquals(repo.runs(1L).status, "failed")
     assertEquals(repo.runs(1L).message, Some("boom"))
+  }
+
+  test("executePairSyncWith calls snapshot once and records expected snapshot artifacts") {
+    val repo = CountingSnapshotRepository()
+    val api = FakeImmichApi()
+
+    val previousLeft = mkAsset("left-gone", "chk-gone")
+    val currentLeft = mkAsset("left-now", "chk-now")
+    val currentRight = mkAsset("right-now", "chk-right")
+
+    val previousRun = repo.startRun(pair.id, dryRun = true)
+    repo.recordObservation(previousRun, pair.id, "left", pair.leftAlbumId, previousLeft)
+    repo.completeRun(previousRun, "success", None)
+
+    api.setAlbumAssets(leftPeer.baseUrl, pair.leftAlbumId, Seq(currentLeft))
+    api.setAlbumAssets(rightPeer.baseUrl, pair.rightAlbumId, Seq(currentRight))
+
+    executePairSyncWith(
+      pair = pair,
+      leftPeer = leftPeer,
+      rightPeer = rightPeer,
+      safety = safety,
+      applyWrites = false,
+      repo = repo,
+      api = api,
+      resolveApiKey = _ => "dummy-key",
+    )
+
+    assertEquals(repo.snapshotCallCount, 1)
+    assert(repo.tombstones.contains((pair.id, "left", previousLeft.id)))
+
+    val runId = repo.runs.keys.max
+    val runObservations = repo.observations.filter(_.runId == runId)
+    assertEquals(runObservations.size, 2)
+    assert(runObservations.exists(_.peerAssetId == currentLeft.id))
+    assert(runObservations.exists(_.peerAssetId == currentRight.id))
+
+    val deletionEvents = repo.events.filter(_.runId == runId).filter(_.eventType == "deletion_detected")
+    assertEquals(deletionEvents.size, 1)
+    assertEquals(deletionEvents.head.direction, "left")
   }
