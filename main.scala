@@ -60,6 +60,107 @@ case class DbRuntime(dataSource: HikariDataSource, xa: Transactor)
 
 case class BulkCheckResp[A](asset: A, assetId: Option[String], isTrashed: Boolean)
 
+trait ImmichApi:
+  def albumGetAssets(album: Album): Seq[AssetResponseDto]
+  def assetBulkCheck(server: ImmichServer, assets: Seq[AssetResponseDto]): Seq[BulkCheckResp[AssetResponseDto]]
+  def untrash(server: ImmichServer, assetIds: Seq[String]): Unit
+  def albumAddAssets(album: Album, assets: Seq[String]): Unit
+  def assetGet(server: ImmichServer, assetId: String): Bytes
+  def assetUpload(server: ImmichServer, uploadRequest: AssetUploadRequest): String
+
+trait SyncRepository:
+  def startRun(pairId: Long, dryRun: Boolean): Long
+  def completeRun(runId: Long, status: String, message: Option[String]): Unit
+  def findPreviousSuccessfulRunId(pairId: Long): Option[Long]
+  def getRunObservations(runId: Long, side: String): Vector[(String, String)]
+  def saveTombstones(
+      pairId: Long,
+      originSide: String,
+      missingAssets: Vector[(String, String)],
+      propagateDeletes: Boolean,
+  ): Unit
+  def recordSyncEvent(
+      runId: Long,
+      pairId: Long,
+      eventType: String,
+      direction: String,
+      assetCount: Int,
+      payloadText: String,
+  ): Unit
+  def recordObservation(
+      runId: Long,
+      pairId: Long,
+      side: String,
+      albumId: String,
+      asset: AssetResponseDto,
+  ): Unit
+
+case class DbSyncRepository(db: DbRuntime) extends SyncRepository:
+  override def startRun(pairId: Long, dryRun: Boolean): Long =
+    transact(db.xa):
+      insertRunStart(pairId, dryRun)
+
+  override def completeRun(runId: Long, status: String, message: Option[String]): Unit =
+    transact(db.xa):
+      finishRun(runId, status, message)
+
+  override def findPreviousSuccessfulRunId(pairId: Long): Option[Long] =
+    connect(db.xa):
+      previousSuccessfulRunId(pairId)
+
+  override def getRunObservations(runId: Long, side: String): Vector[(String, String)] =
+    connect(db.xa):
+      loadRunObservations(runId, side)
+
+  override def saveTombstones(
+      pairId: Long,
+      originSide: String,
+      missingAssets: Vector[(String, String)],
+      propagateDeletes: Boolean,
+  ): Unit =
+    transact(db.xa):
+      upsertTombstones(pairId, originSide, missingAssets, propagateDeletes)
+
+  override def recordSyncEvent(
+      runId: Long,
+      pairId: Long,
+      eventType: String,
+      direction: String,
+      assetCount: Int,
+      payloadText: String,
+  ): Unit =
+    transact(db.xa):
+      insertSyncEvent(runId, pairId, eventType, direction, assetCount, payloadText)
+
+  override def recordObservation(
+      runId: Long,
+      pairId: Long,
+      side: String,
+      albumId: String,
+      asset: AssetResponseDto,
+  ): Unit =
+    transact(db.xa):
+      insertObservation(runId, pairId, side, albumId, asset)
+
+object LiveImmichApi extends ImmichApi:
+  override def albumGetAssets(album: Album): Seq[AssetResponseDto] =
+    liveAlbumGetAssets(album)
+
+  override def assetBulkCheck(server: ImmichServer, assets: Seq[AssetResponseDto]): Seq[BulkCheckResp[AssetResponseDto]] =
+    liveAssetBulkCheck(server, assets)
+
+  override def untrash(server: ImmichServer, assetIds: Seq[String]): Unit =
+    liveUntrash(server, assetIds)
+
+  override def albumAddAssets(album: Album, assets: Seq[String]): Unit =
+    liveAlbumAddAssets(album, assets)
+
+  override def assetGet(server: ImmichServer, assetId: String): Bytes =
+    liveAssetGet(server, assetId)
+
+  override def assetUpload(server: ImmichServer, uploadRequest: AssetUploadRequest): String =
+    liveAssetUpload(server, uploadRequest)
+
 given RW[Bytes] = upickle.readwriter[String].bimap[Bytes](e => Base64.getEncoder.encodeToString(e.array), e => Bytes(Base64.getDecoder.decode(e)))
 
 case class AssetUploadRequest( // upload req also appends fileSize but it doesn't seem to be used
@@ -462,8 +563,27 @@ def assetUpload(server: ImmichServer, uploadRequest: AssetUploadRequest): String
     case _ => throw new RuntimeException(s"failed to upload: $json")
   }
 
+private def liveAlbumGetAssets(album: Album): Seq[AssetResponseDto] =
+  albumGetAssets(album)
+
+private def liveAssetBulkCheck(server: ImmichServer, assets: Seq[AssetResponseDto]): Seq[BulkCheckResp[AssetResponseDto]] =
+  assetBulkCheck(server, assets)(_.checksum)
+
+private def liveUntrash(server: ImmichServer, assetIds: Seq[String]): Unit =
+  untrash(server, assetIds)
+
+private def liveAlbumAddAssets(album: Album, assets: Seq[String]): Unit =
+  albumAddAssets(album, assets)
+
+private def liveAssetGet(server: ImmichServer, assetId: String): Bytes =
+  assetGet(server, assetId)
+
+private def liveAssetUpload(server: ImmichServer, uploadRequest: AssetUploadRequest): String =
+  assetUpload(server, uploadRequest)
+
 def syncOneDirection(
-    xa: Transactor,
+  repo: SyncRepository,
+  api: ImmichApi,
     runId: Long,
     pair: AlbumPair,
     direction: String,
@@ -480,20 +600,20 @@ def syncOneDirection(
   val missingChecksums = sourceByChecksum.keySet.diff(targetChecksums)
   val candidates = sourceAssets.filter(a => missingChecksums.contains(a.checksum))
   if (candidates.nonEmpty) {
-    val bulkCheckResults = assetBulkCheck(targetServer, candidates)(_.checksum)
+    val bulkCheckResults = api.assetBulkCheck(targetServer, candidates)
     val (existingResults, nonExistingResults) = bulkCheckResults.partition(_.assetId.isDefined)
     val toUntrash = existingResults.filter(_.isTrashed).flatMap(_.assetId)
 
     if (toUntrash.nonEmpty && applyWrites) {
-      untrash(targetServer, toUntrash)
+      api.untrash(targetServer, toUntrash)
     }
 
     val uploadedIds =
       if (applyWrites) {
         nonExistingResults.map { dto =>
-          val bytes = assetGet(sourceServer, dto.asset.id)
+          val bytes = api.assetGet(sourceServer, dto.asset.id)
           val uploadRequest = AssetUploadRequest.fromAssetResponseDto(dto.asset, bytes.array)
-          assetUpload(targetServer, uploadRequest)
+          api.assetUpload(targetServer, uploadRequest)
         }
       } else {
         Vector.empty[String]
@@ -507,27 +627,26 @@ def syncOneDirection(
       }
 
     if (addToAlbumIds.nonEmpty && applyWrites) {
-      albumAddAssets(targetAlbum, addToAlbumIds)
+      api.albumAddAssets(targetAlbum, addToAlbumIds)
     }
 
-    transact(xa):
-      val payload = ujson.Obj(
-        "candidates" -> candidates.size,
-        "existing" -> existingResults.size,
-        "to_untrash" -> toUntrash.size,
-        "to_upload" -> nonExistingResults.size,
-        "uploaded" -> uploadedIds.size,
-        "added_to_album" -> addToAlbumIds.size,
-        "apply_writes" -> applyWrites,
-      ).render()
-      insertSyncEvent(
-        runId = runId,
-        pairId = pair.id,
-        eventType = "direction_sync",
-        direction = direction,
-        assetCount = candidates.size,
-        payloadText = payload,
-      )
+    val payload = ujson.Obj(
+      "candidates" -> candidates.size,
+      "existing" -> existingResults.size,
+      "to_untrash" -> toUntrash.size,
+      "to_upload" -> nonExistingResults.size,
+      "uploaded" -> uploadedIds.size,
+      "added_to_album" -> addToAlbumIds.size,
+      "apply_writes" -> applyWrites,
+    ).render()
+    repo.recordSyncEvent(
+      runId = runId,
+      pairId = pair.id,
+      eventType = "direction_sync",
+      direction = direction,
+      assetCount = candidates.size,
+      payloadText = payload,
+    )
   }
 
 def executePairSync(
@@ -538,64 +657,84 @@ def executePairSync(
     safety: SafetyConfig,
     applyWrites: Boolean,
 ): Unit =
+  executePairSyncWith(
+    pair = pair,
+    leftPeer = leftPeer,
+    rightPeer = rightPeer,
+    safety = safety,
+    applyWrites = applyWrites,
+    repo = DbSyncRepository(db),
+    api = LiveImmichApi,
+    resolveApiKey = requiredEnv,
+  )
+
+def executePairSyncWith(
+    pair: AlbumPair,
+    leftPeer: SyncPeer,
+    rightPeer: SyncPeer,
+    safety: SafetyConfig,
+    applyWrites: Boolean,
+    repo: SyncRepository,
+    api: ImmichApi,
+    resolveApiKey: String => String = requiredEnv,
+): Unit =
   assertSafeHost(leftPeer.baseUrl, safety)
   assertSafeHost(rightPeer.baseUrl, safety)
 
-  val leftServer = ImmichServer(leftPeer.baseUrl, requiredEnv(leftPeer.apiKeyEnv))
-  val rightServer = ImmichServer(rightPeer.baseUrl, requiredEnv(rightPeer.apiKeyEnv))
+  val leftServer = ImmichServer(leftPeer.baseUrl, resolveApiKey(leftPeer.apiKeyEnv))
+  val rightServer = ImmichServer(rightPeer.baseUrl, resolveApiKey(rightPeer.apiKeyEnv))
   val leftAlbum = Album(leftServer, pair.leftAlbumId)
   val rightAlbum = Album(rightServer, pair.rightAlbumId)
 
-  val runId = transact(db.xa):
-    insertRunStart(pair.id, dryRun = !applyWrites)
+  val runId = repo.startRun(pair.id, dryRun = !applyWrites)
 
   try {
-    val leftAssets = albumGetAssets(leftAlbum)
-    val rightAssets = albumGetAssets(rightAlbum)
+    val leftAssets = api.albumGetAssets(leftAlbum)
+    val rightAssets = api.albumGetAssets(rightAlbum)
 
-    transact(db.xa):
-      val previousRun = previousSuccessfulRunId(pair.id)
-      val previousLeft = previousRun.map(loadRunObservations(_, "left")).getOrElse(Vector.empty)
-      val previousRight = previousRun.map(loadRunObservations(_, "right")).getOrElse(Vector.empty)
+    val previousRun = repo.findPreviousSuccessfulRunId(pair.id)
+    val previousLeft = previousRun.map(repo.getRunObservations(_, "left")).getOrElse(Vector.empty)
+    val previousRight = previousRun.map(repo.getRunObservations(_, "right")).getOrElse(Vector.empty)
 
-      val currentLeft = leftAssets.map(a => (a.id, a.checksum)).toVector
-      val currentRight = rightAssets.map(a => (a.id, a.checksum)).toVector
+    val currentLeft = leftAssets.map(a => (a.id, a.checksum)).toVector
+    val currentRight = rightAssets.map(a => (a.id, a.checksum)).toVector
 
-      val missingLeft = detectMissing(previousLeft, currentLeft)
-      val missingRight = detectMissing(previousRight, currentRight)
+    val missingLeft = detectMissing(previousLeft, currentLeft)
+    val missingRight = detectMissing(previousRight, currentRight)
 
-      upsertTombstones(pair.id, "left", missingLeft, pair.propagateDeletes)
-      upsertTombstones(pair.id, "right", missingRight, pair.propagateDeletes)
+    repo.saveTombstones(pair.id, "left", missingLeft, pair.propagateDeletes)
+    repo.saveTombstones(pair.id, "right", missingRight, pair.propagateDeletes)
 
-      if (missingLeft.nonEmpty) {
-        insertSyncEvent(
-          runId = runId,
-          pairId = pair.id,
-          eventType = "deletion_detected",
-          direction = "left",
-          assetCount = missingLeft.size,
-          payloadText = ujson.Obj("propagate_deletes" -> pair.propagateDeletes).render(),
-        )
-      }
+    if (missingLeft.nonEmpty) {
+      repo.recordSyncEvent(
+        runId = runId,
+        pairId = pair.id,
+        eventType = "deletion_detected",
+        direction = "left",
+        assetCount = missingLeft.size,
+        payloadText = ujson.Obj("propagate_deletes" -> pair.propagateDeletes).render(),
+      )
+    }
 
-      if (missingRight.nonEmpty) {
-        insertSyncEvent(
-          runId = runId,
-          pairId = pair.id,
-          eventType = "deletion_detected",
-          direction = "right",
-          assetCount = missingRight.size,
-          payloadText = ujson.Obj("propagate_deletes" -> pair.propagateDeletes).render(),
-        )
-      }
+    if (missingRight.nonEmpty) {
+      repo.recordSyncEvent(
+        runId = runId,
+        pairId = pair.id,
+        eventType = "deletion_detected",
+        direction = "right",
+        assetCount = missingRight.size,
+        payloadText = ujson.Obj("propagate_deletes" -> pair.propagateDeletes).render(),
+      )
+    }
 
-      leftAssets.foreach(insertObservation(runId, pair.id, "left", pair.leftAlbumId, _))
-      rightAssets.foreach(insertObservation(runId, pair.id, "right", pair.rightAlbumId, _))
+    leftAssets.foreach(repo.recordObservation(runId, pair.id, "left", pair.leftAlbumId, _))
+    rightAssets.foreach(repo.recordObservation(runId, pair.id, "right", pair.rightAlbumId, _))
 
     pair.mode.toLowerCase match {
       case "bidirectional" =>
         syncOneDirection(
-          xa = db.xa,
+          repo = repo,
+          api = api,
           runId = runId,
           pair = pair,
           direction = "left_to_right",
@@ -608,7 +747,8 @@ def executePairSync(
           applyWrites = applyWrites,
         )
         syncOneDirection(
-          xa = db.xa,
+          repo = repo,
+          api = api,
           runId = runId,
           pair = pair,
           direction = "right_to_left",
@@ -622,7 +762,8 @@ def executePairSync(
         )
       case "left_to_right" =>
         syncOneDirection(
-          xa = db.xa,
+          repo = repo,
+          api = api,
           runId = runId,
           pair = pair,
           direction = "left_to_right",
@@ -636,7 +777,8 @@ def executePairSync(
         )
       case "right_to_left" =>
         syncOneDirection(
-          xa = db.xa,
+          repo = repo,
+          api = api,
           runId = runId,
           pair = pair,
           direction = "right_to_left",
@@ -652,12 +794,10 @@ def executePairSync(
         throw new RuntimeException(s"Unsupported pair mode '$other' for pair '${pair.name}'")
     }
 
-    transact(db.xa):
-      finishRun(runId, status = "success", message = None)
+    repo.completeRun(runId, status = "success", message = None)
   } catch {
     case e: Throwable =>
-      transact(db.xa):
-        finishRun(runId, status = "failed", message = Some(e.getMessage.take(1000)))
+      repo.completeRun(runId, status = "failed", message = Some(e.getMessage.take(1000)))
       throw e
   }
 
