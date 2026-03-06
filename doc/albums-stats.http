@@ -1,4 +1,4 @@
-GET https://immich.example.de/api/activities/statistics?albumId=
+GET http://127.0.0.1:2283/api/activities/statistics?albumId=<album-id>
 x-api-key: {{api_key}}
 Accept: application/json
 

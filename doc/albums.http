@@ -1,5 +1,5 @@
-GET https://immich.example.de/api/albums/
-//GET https://immich.example.de/api/tags
+GET http://127.0.0.1:2283/api/albums/<album-id>
+//GET http://127.0.0.1:2283/api/tags
 x-api-key: {{api_key}}
 Accept: application/json
 
