@@ -1,0 +1,4 @@
+GET https://immich.example.de/api/activities/statistics?albumId=
+x-api-key: {{api_key}}
+Accept: application/json
+
