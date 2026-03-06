@@ -94,6 +94,49 @@ trait SyncRepository:
       albumId: String,
       asset: AssetResponseDto,
   ): Unit
+  def recordRunSnapshot(
+      runId: Long,
+      pair: AlbumPair,
+      leftAssets: Seq[AssetResponseDto],
+      rightAssets: Seq[AssetResponseDto],
+  ): Unit =
+    val previousRun = findPreviousSuccessfulRunId(pair.id)
+    val previousLeft = previousRun.map(getRunObservations(_, "left")).getOrElse(Vector.empty)
+    val previousRight = previousRun.map(getRunObservations(_, "right")).getOrElse(Vector.empty)
+
+    val currentLeft = leftAssets.map(asset => (asset.id, asset.checksum)).toVector
+    val currentRight = rightAssets.map(asset => (asset.id, asset.checksum)).toVector
+
+    val missingLeft = detectMissing(previousLeft, currentLeft)
+    val missingRight = detectMissing(previousRight, currentRight)
+
+    saveTombstones(pair.id, "left", missingLeft, pair.propagateDeletes)
+    saveTombstones(pair.id, "right", missingRight, pair.propagateDeletes)
+
+    if (missingLeft.nonEmpty) {
+      recordSyncEvent(
+        runId = runId,
+        pairId = pair.id,
+        eventType = "deletion_detected",
+        direction = "left",
+        assetCount = missingLeft.size,
+        payloadText = ujson.Obj("propagate_deletes" -> pair.propagateDeletes).render(),
+      )
+    }
+
+    if (missingRight.nonEmpty) {
+      recordSyncEvent(
+        runId = runId,
+        pairId = pair.id,
+        eventType = "deletion_detected",
+        direction = "right",
+        assetCount = missingRight.size,
+        payloadText = ujson.Obj("propagate_deletes" -> pair.propagateDeletes).render(),
+      )
+    }
+
+    leftAssets.foreach(recordObservation(runId, pair.id, "left", pair.leftAlbumId, _))
+    rightAssets.foreach(recordObservation(runId, pair.id, "right", pair.rightAlbumId, _))
 
 case class DbSyncRepository(db: DbRuntime) extends SyncRepository:
   override def startRun(pairId: Long, dryRun: Boolean): Long =
@@ -141,6 +184,51 @@ case class DbSyncRepository(db: DbRuntime) extends SyncRepository:
   ): Unit =
     transact(db.xa):
       insertObservation(runId, pairId, side, albumId, asset)
+
+  override def recordRunSnapshot(
+      runId: Long,
+      pair: AlbumPair,
+      leftAssets: Seq[AssetResponseDto],
+      rightAssets: Seq[AssetResponseDto],
+  ): Unit =
+    transact(db.xa):
+      val previousRun = previousSuccessfulRunId(pair.id)
+      val previousLeft = previousRun.map(loadRunObservations(_, "left")).getOrElse(Vector.empty)
+      val previousRight = previousRun.map(loadRunObservations(_, "right")).getOrElse(Vector.empty)
+
+      val currentLeft = leftAssets.map(asset => (asset.id, asset.checksum)).toVector
+      val currentRight = rightAssets.map(asset => (asset.id, asset.checksum)).toVector
+
+      val missingLeft = detectMissing(previousLeft, currentLeft)
+      val missingRight = detectMissing(previousRight, currentRight)
+
+      upsertTombstones(pair.id, "left", missingLeft, pair.propagateDeletes)
+      upsertTombstones(pair.id, "right", missingRight, pair.propagateDeletes)
+
+      if (missingLeft.nonEmpty) {
+        insertSyncEvent(
+          runId = runId,
+          pairId = pair.id,
+          eventType = "deletion_detected",
+          direction = "left",
+          assetCount = missingLeft.size,
+          payloadText = ujson.Obj("propagate_deletes" -> pair.propagateDeletes).render(),
+        )
+      }
+
+      if (missingRight.nonEmpty) {
+        insertSyncEvent(
+          runId = runId,
+          pairId = pair.id,
+          eventType = "deletion_detected",
+          direction = "right",
+          assetCount = missingRight.size,
+          payloadText = ujson.Obj("propagate_deletes" -> pair.propagateDeletes).render(),
+        )
+      }
+
+      leftAssets.foreach(insertObservation(runId, pair.id, "left", pair.leftAlbumId, _))
+      rightAssets.foreach(insertObservation(runId, pair.id, "right", pair.rightAlbumId, _))
 
 object LiveImmichApi extends ImmichApi:
   override def albumGetAssets(album: Album): Seq[AssetResponseDto] =
@@ -691,44 +779,7 @@ def executePairSyncWith(
   try {
     val leftAssets = api.albumGetAssets(leftAlbum)
     val rightAssets = api.albumGetAssets(rightAlbum)
-
-    val previousRun = repo.findPreviousSuccessfulRunId(pair.id)
-    val previousLeft = previousRun.map(repo.getRunObservations(_, "left")).getOrElse(Vector.empty)
-    val previousRight = previousRun.map(repo.getRunObservations(_, "right")).getOrElse(Vector.empty)
-
-    val currentLeft = leftAssets.map(a => (a.id, a.checksum)).toVector
-    val currentRight = rightAssets.map(a => (a.id, a.checksum)).toVector
-
-    val missingLeft = detectMissing(previousLeft, currentLeft)
-    val missingRight = detectMissing(previousRight, currentRight)
-
-    repo.saveTombstones(pair.id, "left", missingLeft, pair.propagateDeletes)
-    repo.saveTombstones(pair.id, "right", missingRight, pair.propagateDeletes)
-
-    if (missingLeft.nonEmpty) {
-      repo.recordSyncEvent(
-        runId = runId,
-        pairId = pair.id,
-        eventType = "deletion_detected",
-        direction = "left",
-        assetCount = missingLeft.size,
-        payloadText = ujson.Obj("propagate_deletes" -> pair.propagateDeletes).render(),
-      )
-    }
-
-    if (missingRight.nonEmpty) {
-      repo.recordSyncEvent(
-        runId = runId,
-        pairId = pair.id,
-        eventType = "deletion_detected",
-        direction = "right",
-        assetCount = missingRight.size,
-        payloadText = ujson.Obj("propagate_deletes" -> pair.propagateDeletes).render(),
-      )
-    }
-
-    leftAssets.foreach(repo.recordObservation(runId, pair.id, "left", pair.leftAlbumId, _))
-    rightAssets.foreach(repo.recordObservation(runId, pair.id, "right", pair.rightAlbumId, _))
+    repo.recordRunSnapshot(runId, pair, leftAssets, rightAssets)
 
     pair.mode.toLowerCase match {
       case "bidirectional" =>
