@@ -1,0 +1,15 @@
+.git/
+.github/
+.idea/
+.metals/
+.vscode/
+.bsp/
+.bloop/
+.scala-build/
+target/
+project/target/
+project/project/
+doc/
+README.md
+sync.yaml
+*.env

@@ -1,0 +1,26 @@
+# Declarative topology config, loaded via --config=path or IMMICH_SYNC_CONFIG.
+# Peers are keyed by name: changing a baseUrl updates the existing peer row and
+# keeps its stable id, so hostname changes never orphan sync state.
+# API keys are NOT stored here; each peer names the env var holding the key of
+# that instance's DEDICATED SYNC USER (see README, "Setting up a sync user").
+peers:
+  - name: source
+    baseUrl: http://192.168.1.10:2283
+    apiKeyEnv: IMMICH_SOURCE_API_KEY
+  - name: target
+    baseUrl: https://immich.example.org
+    apiKeyEnv: IMMICH_TARGET_API_KEY
+
+# Optional. The primary way to link albums is the [sync <group>] annotation:
+# share each album with its instance's sync user, let the tool stamp it with a
+# generated group id, and copy one id to the partner album. Manual pairs declared
+# here are for cases where you don't want to touch descriptions.
+pairs:
+  - name: family
+    left: { peer: source, album: aaaaaaaa-1111-2222-3333-444444444444 }
+    right: { peer: target, album: bbbbbbbb-1111-2222-3333-444444444444 }
+    mode: bidirectional        # bidirectional | left_to_right | right_to_left
+    deletes: true              # propagate album-membership removals (default true)
+    trashOrphans: true         # trash tool-uploaded assets orphaned by a removal
+    # maxRemovalCount: 25      # per-run circuit breaker overrides
+    # maxRemovalFraction: 0.3
