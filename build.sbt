@@ -18,15 +18,20 @@ lazy val root = (project in file("."))
       "org.flywaydb" % "flyway-database-postgresql" % "13.0.0",
       "org.virtuslab" %% "scala-yaml" % "0.3.2",
       "com.softwaremill.ox" %% "core" % "1.0.5",
+      "ch.qos.logback" % "logback-classic" % "1.5.38" % Runtime,
       "org.scalameta" %% "munit" % "1.3.4" % Test,
       "com.h2database" % "h2" % "2.4.240" % Test,
     ),
     assembly / mainClass := Some("immichsync.main"),
     assembly / assemblyJarName := "app.jar",
     assembly / assemblyMergeStrategy := {
-      case PathList("META-INF", "MANIFEST.MF")     => MergeStrategy.discard
-      case PathList("META-INF", xs @ _*)           => MergeStrategy.first
-      case "module-info.class"                     => MergeStrategy.discard
-      case x                                       => MergeStrategy.first
+      case PathList("META-INF", "MANIFEST.MF")           => MergeStrategy.discard
+      // ServiceLoader registrations MUST be merged, not picked: flyway-core and
+      // flyway-database-postgresql both ship the same Plugin service file, and
+      // "first" silently drops the PostgreSQL support from the fat jar.
+      case PathList("META-INF", "services", _*)          => MergeStrategy.filterDistinctLines
+      case PathList("META-INF", _*)                      => MergeStrategy.first
+      case "module-info.class"                           => MergeStrategy.discard
+      case _                                             => MergeStrategy.first
     },
   )
