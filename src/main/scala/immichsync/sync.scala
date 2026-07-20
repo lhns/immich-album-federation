@@ -1,6 +1,12 @@
 package immichsync
 
 // Sync executor: fetch both sides, plan (pure merge), apply, finalize.
+//
+// Dry-run safety is structural: when applyWrites is false the api and repository are
+// wrapped in read-only facades (dryrun.scala) before any work starts, so every code
+// path below can run unconditionally and still cannot mutate anything in a preview.
+
+import scala.util.control.NonFatal
 
 def applyAdds(
     repo: SyncRepository,
@@ -13,7 +19,7 @@ def applyAdds(
     targetAlbum: Album,
     targetPeerId: Long,
     candidates: Seq[AssetResponseDto],
-    applyWrites: Boolean,
+    applyWrites: Boolean, // reporting only: writes are structurally gated by the facades
     transferConcurrency: Int,
 ): Unit =
   if (candidates.nonEmpty) {
@@ -21,7 +27,7 @@ def applyAdds(
     val (existingResults, nonExistingResults) = bulkCheckResults.partition(_.assetId.isDefined)
     val toUntrash = existingResults.filter(_.isTrashed).flatMap(_.assetId)
 
-    if (toUntrash.nonEmpty && applyWrites) {
+    if (toUntrash.nonEmpty) {
       api.untrash(targetServer, toUntrash)
     }
 
@@ -39,27 +45,17 @@ def applyAdds(
       result
 
     val uploadedIds =
-      if (applyWrites) {
-        parMap(nonExistingResults, transferConcurrency) { dto =>
-          // Live photos: transfer the motion video first, then link the still to it.
-          val targetVideoId = dto.asset.livePhotoVideoId.map { videoId =>
-            val videoDto = api.assetInfo(sourceServer, videoId)
-            uploadOne(videoDto, livePhotoVideoId = None).id
-          }
-          uploadOne(dto.asset, livePhotoVideoId = targetVideoId).id
+      parMap(nonExistingResults, transferConcurrency) { dto =>
+        // Live photos: transfer the motion video first, then link the still to it.
+        val targetVideoId = dto.asset.livePhotoVideoId.map { videoId =>
+          val videoDto = api.assetInfo(sourceServer, videoId)
+          uploadOne(videoDto, livePhotoVideoId = None).id
         }
-      } else {
-        Vector.empty[String]
+        uploadOne(dto.asset, livePhotoVideoId = targetVideoId).id
       }
 
-    val addToAlbumIds =
-      if (applyWrites) {
-        uploadedIds ++ existingResults.flatMap(_.assetId)
-      } else {
-        Vector.empty[String]
-      }
-
-    if (addToAlbumIds.nonEmpty && applyWrites) {
+    val addToAlbumIds = uploadedIds ++ existingResults.flatMap(_.assetId)
+    if (addToAlbumIds.nonEmpty) {
       api.albumAddAssets(targetAlbum, addToAlbumIds)
     }
 
@@ -95,60 +91,73 @@ def applyRemovals(
     targetAlbum: Album,
     targetPeerId: Long,
     removals: Seq[AssetResponseDto],
-    applyWrites: Boolean,
+    applyWrites: Boolean, // reporting only: writes are structurally gated by the facades
 ): Set[String] =
   if (removals.isEmpty) Set.empty
   else {
     val byId = removals.map(a => a.id -> a).toMap
-    var skippedChecksums = Set.empty[String]
+    val result = api.albumRemoveAssets(targetAlbum, removals.map(_.id))
+
+    // Only actions that actually happened land in the deletion log; not_found ids are
+    // effectively removed but were not our doing.
+    val removedAssets = result.removed.flatMap(byId.get)
+    removedAssets.foreach { asset =>
+      repo.recordDeletion(runId, pair.id, targetPeerId, targetAlbum.id, asset.id, asset.checksum, "album_remove")
+    }
+
+    val skippedChecksums = result.skipped.flatMap((id, _) => byId.get(id)).map(_.checksum).toSet
+    if (result.skipped.nonEmpty) {
+      result.skipped.foreach { (id, error) =>
+        System.err.println(s"[pair=${pair.name}] cannot remove asset $id from ${targetAlbum.id}: $error (owner-native asset?)")
+      }
+      repo.recordSyncEvent(
+        runId = runId,
+        pairId = pair.id,
+        eventType = "removal_skipped",
+        direction = direction,
+        assetCount = result.skipped.size,
+        payloadText = ujson.Obj(
+          "skipped" -> result.skipped.map((id, error) => ujson.Obj("assetId" -> id, "error" -> error)),
+        ).render(),
+      )
+    }
+
     var trashedCount = 0
-    var removedCount = 0
+    if (pair.trashOrphanedAssets) {
+      // Trash-eligible only when: this tool created the asset (uploaded_asset provenance),
+      // the user has not marked it (favorite/archive), no album still references it, and
+      // the membership removal above actually succeeded.
+      val unmarked = removedAssets.filterNot(a => a.isFavorite || a.isArchived)
+      val ours = repo.uploadedByTool(targetPeerId, unmarked.map(_.id))
+      val stillsToTrash = unmarked.filter(a => ours.contains(a.id) && api.albumsContainingAsset(targetServer, a.id).isEmpty)
 
-    if (applyWrites) {
-      val result = api.albumRemoveAssets(targetAlbum, removals.map(_.id))
-      removedCount = result.removed.size
-      result.removed.flatMap(byId.get).foreach { asset =>
-        repo.recordDeletion(runId, pair.id, targetPeerId, targetAlbum.id, asset.id, asset.checksum, "album_remove")
+      // Live photos: reclaim the motion video alongside its still — it is never album-
+      // linked, so it would otherwise leak in the sync user's library forever.
+      val videoIds = stillsToTrash.flatMap(_.livePhotoVideoId).distinct
+      val ourVideos = repo.uploadedByTool(targetPeerId, videoIds)
+      val videosToTrash = videoIds.filter(ourVideos.contains).flatMap { videoId =>
+        try {
+          val video = api.assetInfo(targetServer, videoId)
+          Option.when(!video.isFavorite && !video.isArchived && api.albumsContainingAsset(targetServer, videoId).isEmpty)(video)
+        } catch {
+          case NonFatal(_) => None // already gone or unreadable: nothing to reclaim
+        }
       }
 
-      if (result.skipped.nonEmpty) {
-        skippedChecksums = result.skipped.flatMap((id, _) => byId.get(id)).map(_.checksum).toSet
-        result.skipped.foreach { (id, error) =>
-          System.err.println(s"[pair=${pair.name}] cannot remove asset $id from ${targetAlbum.id}: $error (owner-native asset?)")
+      val toTrash = stillsToTrash ++ videosToTrash
+      if (toTrash.nonEmpty) {
+        api.trashAssets(targetServer, toTrash.map(_.id))
+        toTrash.foreach { asset =>
+          repo.recordDeletion(runId, pair.id, targetPeerId, targetAlbum.id, asset.id, asset.checksum, "trash")
         }
-        repo.recordSyncEvent(
-          runId = runId,
-          pairId = pair.id,
-          eventType = "removal_skipped",
-          direction = direction,
-          assetCount = result.skipped.size,
-          payloadText = ujson.Obj(
-            "skipped" -> result.skipped.map((id, error) => ujson.Obj("assetId" -> id, "error" -> error)),
-          ).render(),
-        )
-      }
-
-      if (pair.trashOrphanedAssets) {
-        // Trash-eligible only when: this tool created the asset (uploaded_asset provenance),
-        // the user has not marked it (favorite/archive), no album still references it, and
-        // the membership removal above actually succeeded.
-        val removedAssets = result.removed.flatMap(byId.get)
-        val unmarked = removedAssets.filterNot(a => a.isFavorite || a.isArchived)
-        val ours = repo.uploadedByTool(targetPeerId, unmarked.map(_.id))
-        val toTrash = unmarked.filter(a => ours.contains(a.id) && api.albumsContainingAsset(targetServer, a.id).isEmpty)
-        if (toTrash.nonEmpty) {
-          api.trashAssets(targetServer, toTrash.map(_.id))
-          toTrash.foreach { asset =>
-            repo.recordDeletion(runId, pair.id, targetPeerId, targetAlbum.id, asset.id, asset.checksum, "trash")
-          }
-          trashedCount = toTrash.size
-        }
+        trashedCount = toTrash.size
       }
     }
 
     val payload = ujson.Obj(
-      "album_removed" -> removedCount,
-      "skipped" -> skippedChecksums.size,
+      "album_removed" -> result.removed.size,
+      "already_gone" -> result.missing.size,
+      "skipped" -> result.skipped.size,
       "trashed" -> trashedCount,
       "apply_writes" -> applyWrites,
     ).render()
@@ -206,6 +215,29 @@ def executePairSyncWith(
   assertSafeHost(leftPeer.baseUrl, safety)
   assertSafeHost(rightPeer.baseUrl, safety)
 
+  // Structural dry-run guarantee: without applyWrites, neither Immich nor the sync
+  // state can be mutated below, regardless of any further flag handling.
+  val (effectiveApi, effectiveRepo) =
+    if (applyWrites) (api, repo)
+    else (DryRunImmichApi(api), DryRunSyncRepository(repo))
+
+  executePairSyncGuarded(
+    pair, leftPeer, rightPeer, applyWrites,
+    effectiveRepo, effectiveApi, resolveApiKey, thresholds, transferConcurrency, retention,
+  )
+
+private def executePairSyncGuarded(
+    pair: AlbumPair,
+    leftPeer: SyncPeer,
+    rightPeer: SyncPeer,
+    applyWrites: Boolean,
+    repo: SyncRepository,
+    api: ImmichApi,
+    resolveApiKey: String => String,
+    thresholds: Thresholds,
+    transferConcurrency: Int,
+    retention: RetentionConfig,
+): Unit =
   val leftServer = ImmichServer(leftPeer.baseUrl, resolveApiKey(leftPeer.apiKeyEnv))
   val rightServer = ImmichServer(rightPeer.baseUrl, resolveApiKey(rightPeer.apiKeyEnv))
   val leftAlbum = Album(leftServer, pair.leftAlbumId)
@@ -224,9 +256,11 @@ def executePairSyncWith(
     val baselineRight = baselineRunId.map(repo.getRunObservations(_, "right")).getOrElse(Vector.empty)
     val activeTombstones = repo.loadActiveTombstones(pair.id)
 
-    val pairThresholds = Thresholds(
-      maxRemovalCount = pair.maxRemovalCount.getOrElse(thresholds.maxRemovalCount),
-      maxRemovalFraction = pair.maxRemovalFraction.getOrElse(thresholds.maxRemovalFraction),
+    // Circuit-breaker thresholds resolve per side: pair override, then the side's
+    // peer (server-level, from the config file), then the global default.
+    def sideThresholds(peer: SyncPeer) = Thresholds(
+      maxRemovalCount = pair.maxRemovalCount.orElse(peer.maxRemovalCount).getOrElse(thresholds.maxRemovalCount),
+      maxRemovalFraction = pair.maxRemovalFraction.orElse(peer.maxRemovalFraction).getOrElse(thresholds.maxRemovalFraction),
     )
 
     val plan = computeMergePlan(MergeInput(
@@ -236,7 +270,8 @@ def executePairSyncWith(
       leftAssets = leftAssets,
       rightAssets = rightAssets,
       activeTombstones = activeTombstones,
-      thresholds = pairThresholds,
+      thresholdsLeft = sideThresholds(leftPeer),
+      thresholdsRight = sideThresholds(rightPeer),
       forceAdditive = forceAdditive,
     ))
 
@@ -250,8 +285,14 @@ def executePairSyncWith(
           assetCount = 0,
           payloadText = ujson.Obj("reason" -> reason, "apply_writes" -> applyWrites).render(),
         )
-        // A dry run reports the breach but does not mutate pair state.
-        if (applyWrites) repo.markQuarantined(pair.id, reason)
+        if (applyWrites) {
+          val rearmKey = generateGroupToken()
+          repo.markQuarantined(pair.id, reason, rearmKey)
+          println(s"[pair=${pair.name}] QUARANTINED: $reason")
+          println(s"[pair=${pair.name}] to re-arm, set IMMICH_SYNC_REARM=$rearmKey and restart (or run --rearm=${pair.name})")
+        } else {
+          println(s"[pair=${pair.name}] would be quarantined (dry run): $reason")
+        }
         repo.completeRun(runId, status = "quarantined", message = Some(reason))
 
       case None =>
@@ -316,16 +357,14 @@ def executePairSyncWith(
           else write
         }
 
-        // Dry runs record observations for audit but leave sync state (tombstones,
-        // resolutions, force_additive) untouched: baselines exclude dry runs anyway.
         repo.finalizeRun(
           runId = runId,
           pair = pair,
-          tombstoneWrites = if (applyWrites) tombstoneWrites else Seq.empty,
-          resolutions = if (applyWrites) plan.resolutions else Seq.empty,
+          tombstoneWrites = tombstoneWrites,
+          resolutions = plan.resolutions,
           observationsLeft = leftAssets.map(a => ObservationRow(a.id, a.checksum, a.isTrashed)),
           observationsRight = rightAssets.map(a => ObservationRow(a.id, a.checksum, a.isTrashed)),
-          clearForceAdditive = applyWrites,
+          applyRun = applyWrites,
           observationKeepRuns = retention.observationKeepRuns,
         )
     }

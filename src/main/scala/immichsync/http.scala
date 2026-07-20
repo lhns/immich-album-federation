@@ -14,7 +14,7 @@ trait ImmichApi:
   def updateAlbumDescription(album: Album, description: String): Unit
   def albumGetAssets(album: Album): Seq[AssetResponseDto]
   def assetInfo(server: ImmichServer, assetId: String): AssetResponseDto
-  def assetBulkCheck(server: ImmichServer, assets: Seq[AssetResponseDto]): Seq[BulkCheckResp[AssetResponseDto]]
+  def assetBulkCheck(server: ImmichServer, assets: Seq[AssetResponseDto]): Seq[BulkCheckResp]
   def untrash(server: ImmichServer, assetIds: Seq[String]): Unit
   def albumAddAssets(album: Album, assetIds: Seq[String]): Unit
   def albumRemoveAssets(album: Album, assetIds: Seq[String]): AlbumRemoveResult
@@ -71,36 +71,30 @@ class LiveImmichApi(backend: SyncBackend) extends ImmichApi:
   // with a 404 instead of looking like an empty search result.
   override def albumGetAssets(album: Album): Seq[AssetResponseDto] =
     withRetry() {
-      val info = sendJson(
+      sendJson(
         base(album.server).get(uri"${album.server.apiBaseUrl}/albums/${album.id}?withoutAssets=true"),
         "get album",
       )
-      info.obj.get("assets").flatMap(_.arrOpt) match {
-        // Pre-v3 servers still embed the full asset list; use it directly.
-        case Some(embedded) if embedded.nonEmpty =>
-          embedded.map(asset => upickle.default.read[AssetResponseDto](asset)).toSeq
-        case _ =>
-          val results = Seq.newBuilder[AssetResponseDto]
-          var page: Option[Int] = Some(1)
-          while (page.isDefined) {
-            // A failed page throws: a truncated listing must never become an observation set.
-            val json = sendJson(
-              base(album.server)
-                .post(uri"${album.server.apiBaseUrl}/search/metadata")
-                .body(ujson.Obj(
-                  "albumIds" -> ujson.Arr(album.id),
-                  "page" -> page.get,
-                  "size" -> 1000,
-                ).render())
-                .contentType("application/json"),
-              "search album assets",
-            )
-            val assets = json("assets")
-            results ++= assets("items").arr.map(asset => upickle.default.read[AssetResponseDto](asset))
-            page = assets.obj.get("nextPage").flatMap(_.strOpt).map(_.toInt)
-          }
-          results.result()
+      val results = Seq.newBuilder[AssetResponseDto]
+      var page: Option[Int] = Some(1)
+      while (page.isDefined) {
+        // A failed page throws: a truncated listing must never become an observation set.
+        val json = sendJson(
+          base(album.server)
+            .post(uri"${album.server.apiBaseUrl}/search/metadata")
+            .body(ujson.Obj(
+              "albumIds" -> ujson.Arr(album.id),
+              "page" -> page.get,
+              "size" -> 1000,
+            ).render())
+            .contentType("application/json"),
+          "search album assets",
+        )
+        val assets = json("assets")
+        results ++= assets("items").arr.map(asset => upickle.default.read[AssetResponseDto](asset))
+        page = assets.obj.get("nextPage").flatMap(_.strOpt).map(_.toInt)
       }
+      results.result()
     }
 
   override def assetInfo(server: ImmichServer, assetId: String): AssetResponseDto =
@@ -110,7 +104,7 @@ class LiveImmichApi(backend: SyncBackend) extends ImmichApi:
       )
     }
 
-  override def assetBulkCheck(server: ImmichServer, assets: Seq[AssetResponseDto]): Seq[BulkCheckResp[AssetResponseDto]] =
+  override def assetBulkCheck(server: ImmichServer, assets: Seq[AssetResponseDto]): Seq[BulkCheckResp] =
     if (assets.isEmpty) Seq.empty
     else withRetry() {
       val assetById = assets.map(asset => asset.id -> asset).toMap
@@ -146,7 +140,11 @@ class LiveImmichApi(backend: SyncBackend) extends ImmichApi:
         "untrash",
       )
       val count = json("count").num.toLong
-      require(count == assetIds.size, "not all items could be untrashed")
+      // A lower count is a benign race (someone restored an asset meanwhile); the goal
+      // state is reached either way, so warn instead of failing the run.
+      if (count != assetIds.size) {
+        System.err.println(s"[untrash] restored $count of ${assetIds.size} requested assets")
+      }
     }
 
   // PUT /api/albums/{id}/assets returns one BulkIdResponseDto per id; an id that is
@@ -167,9 +165,10 @@ class LiveImmichApi(backend: SyncBackend) extends ImmichApi:
     }
 
   // Best-effort: a sync user (album editor) may only remove assets it owns; per-id
-  // permission failures are reported as skipped, never thrown.
+  // permission failures are reported as skipped, never thrown. not_found ids count as
+  // effectively removed but are reported separately so the audit log stays truthful.
   override def albumRemoveAssets(album: Album, assetIds: Seq[String]): AlbumRemoveResult =
-    if (assetIds.isEmpty) AlbumRemoveResult(Seq.empty, Seq.empty)
+    if (assetIds.isEmpty) AlbumRemoveResult(Seq.empty)
     else {
       val results = sendJson(
         base(album.server)
@@ -177,13 +176,14 @@ class LiveImmichApi(backend: SyncBackend) extends ImmichApi:
           .body(ujson.Obj("ids" -> assetIds).render())
           .contentType("application/json"),
         "album remove assets",
-      ).arr
-      val (ok, failed) = results.toSeq.partition { e =>
-        e("success").bool || e.obj.get("error").exists(_.strOpt.contains("not_found"))
-      }
+      ).arr.toSeq
+      def error(e: ujson.Value): Option[String] = e.obj.get("error").flatMap(_.strOpt)
+      val (ok, rest) = results.partition(_("success").bool)
+      val (missing, failed) = rest.partition(e => error(e).contains("not_found"))
       AlbumRemoveResult(
         removed = ok.map(_("id").str),
-        skipped = failed.map(e => e("id").str -> e.obj.get("error").flatMap(_.strOpt).getOrElse("unknown")),
+        missing = missing.map(_("id").str),
+        skipped = failed.map(e => e("id").str -> error(e).getOrElse("unknown")),
       )
     }
 
@@ -229,7 +229,6 @@ class LiveImmichApi(backend: SyncBackend) extends ImmichApi:
         uploadRequest.isFavorite.map(v => multipart("isFavorite", v.toString)),
         uploadRequest.livePhotoVideoId.map(multipart("livePhotoVideoId", _)),
         uploadRequest.visibility.map(multipart("visibility", _)),
-        uploadRequest.sidecarData.map(b => multipart("sidecarData", b).fileName(s"${uploadRequest.filename}.xmp")),
       ).flatten
 
       var request = basicRequest

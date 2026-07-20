@@ -9,6 +9,8 @@ CREATE TABLE IF NOT EXISTS sync_peer (
   base_url TEXT NOT NULL,
   api_key_env TEXT NOT NULL,
   enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  max_removal_count INTEGER,
+  max_removal_fraction DOUBLE PRECISION,
   created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );
 
@@ -54,8 +56,12 @@ CREATE TABLE IF NOT EXISTS album_pair (
   link_source TEXT NOT NULL DEFAULT 'manual',
   quarantined_at TIMESTAMP WITH TIME ZONE,
   quarantine_reason TEXT,
+  -- One-shot re-arm token, generated per quarantine incident and printed to the log.
+  -- Consumed (cleared) on re-arm; a new trip generates a new key, so a stale
+  -- IMMICH_SYNC_REARM value can never re-arm a later incident.
+  rearm_key TEXT,
   max_removal_count INTEGER,
-  max_removal_fraction REAL,
+  max_removal_fraction DOUBLE PRECISION,
   created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
   updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
   CONSTRAINT album_pair_mode_chk CHECK (mode IN ('bidirectional', 'left_to_right', 'right_to_left')),

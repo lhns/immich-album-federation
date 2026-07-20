@@ -69,6 +69,28 @@ class ConfigSuite extends munit.FunSuite:
     assert(parseSyncConfig("peers: [ {{{").isLeft)
   }
 
+  test("config: validation catches negative thresholds and empty pair names") {
+    val config = SyncConfig(
+      peers = List(PeerConfig("source", "http://a", "K1", maxRemovalCount = Some(-1))),
+      pairs = Some(List(
+        PairConfig("  ", PairEndpointConfig("source", uuidA), PairEndpointConfig("source", uuidB), maxRemovalCount = Some(-5)),
+      )),
+    )
+    val errors = validateSyncConfig(config)
+    assert(errors.exists(_.contains("invalid maxRemovalCount -1")))
+    assert(errors.exists(_.contains("empty name")))
+    assert(errors.exists(_.contains("invalid maxRemovalCount -5")))
+  }
+
+  test("booleans: valid values parse, garbage is rejected loudly") {
+    assertEquals(parseBoolValue("true"), Some(true))
+    assertEquals(parseBoolValue(" Yes "), Some(true))
+    assertEquals(parseBoolValue("0"), Some(false))
+    assertEquals(parseBoolValue("off"), Some(false))
+    assertEquals(parseBoolValue("ture"), None)
+    assertEquals(parseBoolValue(""), None)
+  }
+
   test("interval: units, plain seconds, whitespace and empty") {
     assertEquals(parseIntervalSeconds("30s"), Some(30L))
     assertEquals(parseIntervalSeconds("15m"), Some(900L))

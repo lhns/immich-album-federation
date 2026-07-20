@@ -7,6 +7,9 @@ peers:
   - name: source
     baseUrl: http://192.168.1.10:2283
     apiKeyEnv: IMMICH_SOURCE_API_KEY
+    # enabled: false           # server-level pause: skips all this peer's pairs
+    # maxRemovalCount: 25      # per-server circuit-breaker overrides
+    # maxRemovalFraction: 0.3
   - name: target
     baseUrl: https://immich.example.org
     apiKeyEnv: IMMICH_TARGET_API_KEY

@@ -135,7 +135,7 @@ class DbRepositorySuite extends munit.FunSuite:
       assert(quarantineReason.exists(_.contains("lost")))
 
       val (rearmed, cleared) = transact(db.xa):
-        (rearmPair(pair.name), rearmTombstones(pair.name))
+        rearmPairByName(pair.name)
       assertEquals(rearmed, 1)
       assertEquals(cleared, 0) // the only tombstone was already resolved
       val reloaded = connect(db.xa)(loadAllPairs()).head
@@ -174,9 +174,9 @@ class DbRepositorySuite extends munit.FunSuite:
       // Two apply runs (the newer is the baseline) + deletion log + tombstones.
       val repo = DbSyncRepository(db)
       val oldRun = repo.startRun(pair.id, dryRun = false)
-      repo.finalizeRun(oldRun, pair, Seq.empty, Seq.empty, Seq(ObservationRow("a1", "c1", false)), Seq.empty, clearForceAdditive = false)
+      repo.finalizeRun(oldRun, pair, Seq.empty, Seq.empty, Seq(ObservationRow("a1", "c1", false)), Seq.empty, applyRun = true)
       val baselineRun = repo.startRun(pair.id, dryRun = false)
-      repo.finalizeRun(baselineRun, pair, Seq.empty, Seq.empty, Seq(ObservationRow("a1", "c1", false)), Seq.empty, clearForceAdditive = false)
+      repo.finalizeRun(baselineRun, pair, Seq.empty, Seq.empty, Seq(ObservationRow("a1", "c1", false)), Seq.empty, applyRun = true)
 
       repo.recordDeletion(oldRun, pair.id, rightPeer.id, "album-right", "x1", "cX", "album_remove")
       repo.recordUploadedAsset(oldRun, pair.id, rightPeer.id, "x1", "cX")
@@ -258,6 +258,66 @@ class DbRepositorySuite extends munit.FunSuite:
     }
   }
 
+  test("rearm keys: issued on trip, consumed on use, re-trip issues a new key") {
+    withDb { db =>
+      val (leftPeer, rightPeer) = seedPeers(db)
+      val repo = DbSyncRepository(db)
+      var pair = seedAnnotationPair(db, leftPeer, rightPeer)
+
+      // Baseline with one shared photo, then a strict breaker and a removal on the left.
+      val run0 = repo.startRun(pair.id, dryRun = false)
+      repo.finalizeRun(run0, pair, Seq.empty, Seq.empty,
+        Seq(ObservationRow("a1", "c1", false)), Seq(ObservationRow("b1", "c1", false)), applyRun = true)
+      transact(db.xa):
+        sql"UPDATE album_pair SET max_removal_count = 0, force_additive = FALSE WHERE id = ${pair.id}".update.run()
+      pair = connect(db.xa)(loadAllPairs()).head
+
+      val api = FakeImmichApi()
+      api.setAlbumAssets(leftPeer.baseUrl, "album-left", Seq.empty)
+      api.setAlbumAssets(rightPeer.baseUrl, "album-right", Seq(mkAsset("b1", "c1")))
+      runSync(db, api, pair, leftPeer, rightPeer)
+
+      val quarantined = connect(db.xa)(selectQuarantinedPairs())
+      assertEquals(quarantined.size, 1)
+      val key1 = quarantined.head._3.get
+      assert(key1.nonEmpty)
+
+      // Unknown key: no-op. Correct key: re-arms once, then is consumed.
+      assertEquals(transact(db.xa)(rearmByKey("not-a-key")), None)
+      assertEquals(transact(db.xa)(rearmByKey(key1)), Some(pair.name))
+      assert(connect(db.xa)(selectQuarantinedPairs()).isEmpty)
+      assert(connect(db.xa)(loadAllPairs()).head.forceAdditive)
+      assertEquals(transact(db.xa)(rearmByKey(key1)), None)
+
+      // Trip again: a fresh key is issued.
+      transact(db.xa):
+        sql"UPDATE album_pair SET force_additive = FALSE WHERE id = ${pair.id}".update.run()
+      pair = connect(db.xa)(loadAllPairs()).head
+      runSync(db, api, pair, leftPeer, rightPeer)
+      val key2 = connect(db.xa)(selectQuarantinedPairs()).head._3.get
+      assert(key1 != key2)
+    }
+  }
+
+  test("per-peer circuit-breaker thresholds are stored and loaded") {
+    withDb { db =>
+      applySyncConfig(db, SyncConfig(peers = List(
+        leftPeerCfg.copy(maxRemovalCount = Some(100), maxRemovalFraction = Some(0.9)),
+        rightPeerCfg,
+      )))
+      val peers = connect(db.xa)(loadEnabledPeers())
+      val left = peers.find(_.name == "left").get
+      val right = peers.find(_.name == "right").get
+      assertEquals(left.maxRemovalCount, Some(100))
+      assertEquals(left.maxRemovalFraction, Some(0.9))
+      assertEquals(right.maxRemovalCount, None)
+
+      // Upsert clears overrides when the config drops them.
+      applySyncConfig(db, SyncConfig(peers = List(leftPeerCfg, rightPeerCfg)))
+      assertEquals(connect(db.xa)(loadEnabledPeers()).find(_.name == "left").get.maxRemovalCount, None)
+    }
+  }
+
   test("config application on H2: peer upsert keeps ids stable, endpoint change forces additive") {
     withDb { db =>
       val config = SyncConfig(
@@ -290,5 +350,74 @@ class DbRepositorySuite extends munit.FunSuite:
       val pair2 = connect(db.xa)(selectPairByName("family")).get
       assertEquals(pair2.leftAlbumId, "album-OTHER")
       assert(pair2.forceAdditive)
+    }
+  }
+
+  test("dry-run discovery writes nothing: no stamps, no pairs, no membership") {
+    withDb { db =>
+      val (leftPeer, rightPeer) = seedPeers(db)
+      val api = FakeImmichApi()
+      api.setAlbumList(leftPeer.baseUrl, Seq(AlbumSummary("album-a", "A", "")))
+      api.setAlbumList(rightPeer.baseUrl, Seq(AlbumSummary("album-b", "B", "[sync grp-x]")))
+
+      runAnnotationDiscovery(db, api, safety, _ => "k", applyWrites = false)
+
+      assert(api.descriptionUpdates.isEmpty)
+      assertEquals(connect(db.xa)(loadAllPairs()).size, 0)
+      assertEquals(connect(db.xa)(countSyncAlbums()), 0L)
+      assertEquals(connect(db.xa)(countSyncGroups()), 0L)
+    }
+  }
+
+  test("dry-run cycles on H2 never prune the baseline observations") {
+    withDb { db =>
+      val (leftPeer, rightPeer) = seedPeers(db)
+      var pair = seedAnnotationPair(db, leftPeer, rightPeer)
+      val api = FakeImmichApi()
+      api.setAlbumAssets(leftPeer.baseUrl, "album-left", Seq(mkAsset("a1", "c1")))
+      api.setAlbumAssets(rightPeer.baseUrl, "album-right", Seq(mkAsset("b1", "c1")))
+      val retention = RetentionConfig(observationKeepRuns = 2, auditRetentionDays = 90)
+
+      runSync(db, api, pair, leftPeer, rightPeer, retention = retention)
+      val baseline = connect(db.xa)(previousBaselineRunId(pair.id)).get
+      pair = connect(db.xa)(loadAllPairs()).head
+
+      (1 to 4).foreach { _ =>
+        executePairSyncWith(
+          pair = pair, leftPeer = leftPeer, rightPeer = rightPeer, safety = safety,
+          applyWrites = false, repo = DbSyncRepository(db), api = api,
+          resolveApiKey = _ => "dummy-key", retention = retention,
+        )
+      }
+
+      assertEquals(connect(db.xa)(previousBaselineRunId(pair.id)), Some(baseline))
+      assertEquals(connect(db.xa)(loadRunObservations(baseline, "left")).size, 1)
+    }
+  }
+
+  test("peer names match case-insensitively: renaming case keeps the same row") {
+    withDb { db =>
+      applySyncConfig(db, SyncConfig(peers = List(leftPeerCfg, rightPeerCfg)))
+      val originalId = connect(db.xa)(loadEnabledPeers()).find(_.name == "left").get.id
+
+      applySyncConfig(db, SyncConfig(peers = List(leftPeerCfg.copy(name = "LEFT"), rightPeerCfg)))
+      val peers = connect(db.xa)(loadAllPeers())
+      assertEquals(peers.size, 2)
+      val renamed = peers.find(_.name == "LEFT").get
+      assertEquals(renamed.id, originalId)
+    }
+  }
+
+  test("abandoned running runs are marked aborted at startup and become prunable") {
+    withDb { db =>
+      val (leftPeer, rightPeer) = seedPeers(db)
+      val pair = seedAnnotationPair(db, leftPeer, rightPeer)
+      val repo = DbSyncRepository(db)
+      repo.startRun(pair.id, dryRun = false) // never finished: simulated crash
+
+      val marked = transact(db.xa)(markAbandonedRuns())
+      assertEquals(marked, 1)
+      val statuses = connect(db.xa)(sql"SELECT status FROM sync_run".query[String].run())
+      assertEquals(statuses, Vector("aborted"))
     }
   }

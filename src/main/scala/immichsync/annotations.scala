@@ -40,7 +40,8 @@ def parseSyncAnnotations(description: String): ParsedAnnotations =
     warnings += "legacy [mirror ...] annotation is no longer supported, use [sync <group>]"
   }
   SyncAnnotationRe.findAllMatchIn(description).foreach { m =>
-    val group = m.group(1)
+    // Tokens are case-insensitive ([sync Family] links with [sync family]).
+    val group = m.group(1).toLowerCase
     val optsRaw = Option(m.group(2)).getOrElse("").trim
     val opts = if (optsRaw.isEmpty) Seq.empty else optsRaw.split("\\s+").toSeq
     var deletes: Option[Boolean] = None
@@ -197,7 +198,11 @@ private def flipMode(mode: String): String = mode match {
   case other           => other
 }
 
-def reconcilePairs(existingPairs: Vector[AlbumPair], links: Seq[DiscoveredLink]): PairReconciliation =
+def reconcilePairs(
+    existingPairs: Vector[AlbumPair],
+    links: Seq[DiscoveredLink],
+    scannedPeerIds: Set[Long],
+): PairReconciliation =
   val byEndpoints = existingPairs
     .map(p => (p.leftPeerId, p.leftAlbumId, p.rightPeerId, p.rightAlbumId) -> p)
     .toMap
@@ -232,9 +237,14 @@ def reconcilePairs(existingPairs: Vector[AlbumPair], links: Seq[DiscoveredLink])
   // Annotation-created pairs whose group membership disappeared are disabled, never
   // deleted: run history, tombstones and the deletion log stay intact. Re-grouping
   // later re-enables (or re-creates) with force_additive so a stale baseline cannot
-  // drive removals.
+  // drive removals. Only pairs whose BOTH peers were scanned can be judged: a peer
+  // that is disabled (server-level pause) or unreachable must not look like "all its
+  // albums were unlinked".
   val disables = existingPairs
-    .filter(p => p.linkSource == "annotation" && p.enabled && !matchedIds.contains(p.id))
+    .filter(p =>
+      p.linkSource == "annotation" && p.enabled && !matchedIds.contains(p.id) &&
+        scannedPeerIds.contains(p.leftPeerId) && scannedPeerIds.contains(p.rightPeerId)
+    )
     .map(_.id)
 
   PairReconciliation(inserts.toSeq, updates.toSeq, disables, warnings.toSeq)
@@ -249,7 +259,9 @@ def loadAllPairs()(using DbCon): Vector[AlbumPair] =
       FROM album_pair
     """.query[PairRow].run().map(pairFromRow)
 
-def insertAnnotationPair(name: String, link: DiscoveredLink)(using DbTx): Unit =
+// Returns the number of rows inserted (0 when ON CONFLICT swallowed the insert, e.g. an
+// auto-name collision) so the caller can report honestly instead of silently dropping.
+def insertAnnotationPair(name: String, link: DiscoveredLink)(using DbTx): Int =
   sql"""
       INSERT INTO album_pair(
         name, left_peer_id, left_album_id, right_peer_id, right_album_id,
@@ -298,38 +310,55 @@ def runAnnotationDiscovery(
     println("[discover] no enabled peers, skipping annotation discovery")
   } else {
     peers.foreach(p => assertSafeHost(p.baseUrl, safety))
+    // Structural dry-run guarantee for the Immich side: stamping goes through the
+    // read-only facade when not applying.
+    val effectiveApi = if (applyWrites) api else DryRunImmichApi(api)
     val serverByPeerId = peers.map(p => p.id -> ImmichServer(p.baseUrl, resolveApiKey(p.apiKeyEnv))).toMap
     // A failed album listing aborts discovery for ALL peers: an unreachable peer must
     // not look like "no annotations" and disable its pairs.
-    val albumsByPeer = peers.map(peer => peer.id -> api.listAlbums(serverByPeerId(peer.id))).toMap
+    val albumsByPeer = peers.map(peer => peer.id -> effectiveApi.listAlbums(serverByPeerId(peer.id))).toMap
 
     val plan = planDiscovery(peers, albumsByPeer)
     plan.warnings.foreach(w => println(s"[discover] $w"))
 
     plan.autoAnnotations.foreach { annotation =>
-      if (applyWrites) {
-        api.updateAlbumDescription(Album(serverByPeerId(annotation.peerId), annotation.albumId), annotation.newDescription)
-        println(s"[discover] stamped album ${annotation.albumId} with [sync ${annotation.token}]")
-      } else {
-        println(s"[discover] would stamp album ${annotation.albumId} with [sync ${annotation.token}] (dry run)")
-      }
+      effectiveApi.updateAlbumDescription(Album(serverByPeerId(annotation.peerId), annotation.albumId), annotation.newDescription)
+      if (applyWrites) println(s"[discover] stamped album ${annotation.albumId} with [sync ${annotation.token}]")
     }
 
     val existing = connect(db.xa)(loadAllPairs())
-    val rec = reconcilePairs(existing, plan.links)
+    val rec = reconcilePairs(existing, plan.links, scannedPeerIds = albumsByPeer.keySet)
     rec.warnings.foreach(w => println(s"[discover] $w"))
     val peerNameById = peers.map(p => p.id -> p.name).toMap
-    transact(db.xa):
-      plan.memberships.foreach { membership =>
-        val groupId = membership.group.map(upsertSyncGroup)
-        upsertSyncAlbum(membership.peerId, membership.albumId, groupId, membership.deletes, membership.direction)
-      }
-      rec.inserts.foreach(link => insertAnnotationPair(autoPairName(peerNameById, link), link))
-      rec.updates.foreach(updateAnnotationPair)
-      rec.disables.foreach(disableAnnotationPair)
-    println(
-      s"[discover] groups=${plan.memberships.flatMap(_.group).distinct.size} links=${plan.links.size} " +
-        s"inserted=${rec.inserts.size} updated=${rec.updates.size} disabled=${rec.disables.size} " +
-        s"stamped=${plan.autoAnnotations.size}"
-    )
+
+    if (applyWrites) {
+      val inserted = transact(db.xa):
+        plan.memberships.foreach { membership =>
+          val groupId = membership.group.map(upsertSyncGroup)
+          upsertSyncAlbum(membership.peerId, membership.albumId, groupId, membership.deletes, membership.direction)
+        }
+        val insertCounts = rec.inserts.map { link =>
+          val name = autoPairName(peerNameById, link)
+          val count = insertAnnotationPair(name, link)
+          if (count == 0) {
+            System.err.println(s"[discover] pair '$name' was NOT created (name or endpoint conflict); rename the colliding pair")
+          }
+          count
+        }.sum
+        rec.updates.foreach(updateAnnotationPair)
+        rec.disables.foreach(disableAnnotationPair)
+        insertCounts
+      println(
+        s"[discover] groups=${plan.memberships.flatMap(_.group).distinct.size} links=${plan.links.size} " +
+          s"inserted=$inserted updated=${rec.updates.size} disabled=${rec.disables.size} " +
+          s"stamped=${plan.autoAnnotations.size}"
+      )
+    } else {
+      // Dry runs leave the topology untouched too: report what a real run would do.
+      println(
+        s"[discover] dry run: would insert ${rec.inserts.size}, update ${rec.updates.size}, " +
+          s"disable ${rec.disables.size} pair(s); groups=${plan.memberships.flatMap(_.group).distinct.size} links=${plan.links.size}"
+      )
+      rec.disables.foreach(id => println(s"[discover] dry run: would disable pair id $id (membership vanished)"))
+    }
   }

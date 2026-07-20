@@ -32,7 +32,9 @@ trait SyncRepository:
       checksum: String,
       action: String,
   ): Unit
-  def markQuarantined(pairId: Long, reason: String): Unit
+  def markQuarantined(pairId: Long, reason: String, rearmKey: String): Unit
+  // applyRun = this was a real (non-dry) run: only then is force_additive cleared and
+  // observation retention pruned. Dry runs record observations for audit and nothing else.
   def finalizeRun(
       runId: Long,
       pair: AlbumPair,
@@ -40,7 +42,7 @@ trait SyncRepository:
       resolutions: Seq[TombstoneResolutionPlan],
       observationsLeft: Seq[ObservationRow],
       observationsRight: Seq[ObservationRow],
-      clearForceAdditive: Boolean,
+      applyRun: Boolean,
       observationKeepRuns: Int = RetentionConfig.Default.observationKeepRuns,
   ): Unit
 
@@ -96,9 +98,9 @@ case class DbSyncRepository(db: DbRuntime) extends SyncRepository:
     transact(db.xa):
       insertDeletionLog(runId, pairId, peerId, albumId, assetId, checksum, action)
 
-  override def markQuarantined(pairId: Long, reason: String): Unit =
+  override def markQuarantined(pairId: Long, reason: String, rearmKey: String): Unit =
     transact(db.xa):
-      updatePairQuarantined(pairId, reason)
+      updatePairQuarantined(pairId, reason, rearmKey)
 
   override def finalizeRun(
       runId: Long,
@@ -107,7 +109,7 @@ case class DbSyncRepository(db: DbRuntime) extends SyncRepository:
       resolutions: Seq[TombstoneResolutionPlan],
       observationsLeft: Seq[ObservationRow],
       observationsRight: Seq[ObservationRow],
-      clearForceAdditive: Boolean,
+      applyRun: Boolean,
       observationKeepRuns: Int = RetentionConfig.Default.observationKeepRuns,
   ): Unit =
     transact(db.xa):
@@ -115,8 +117,8 @@ case class DbSyncRepository(db: DbRuntime) extends SyncRepository:
       resolutions.foreach(r => resolveTombstone(pair.id, r.originSide, r.checksum, r.resolution))
       observationsLeft.foreach(insertObservation(runId, pair.id, "left", pair.leftAlbumId, _))
       observationsRight.foreach(insertObservation(runId, pair.id, "right", pair.rightAlbumId, _))
-      if (clearForceAdditive && pair.forceAdditive) updatePairForceAdditive(pair.id, forceAdditive = false)
-      pruneObservations(pair.id, observationKeepRuns)
+      if (applyRun && pair.forceAdditive) updatePairForceAdditive(pair.id, forceAdditive = false)
+      if (applyRun) pruneObservations(pair.id, observationKeepRuns)
       finishRun(runId, "success", None)
 
 def createDbRuntime(url: String, user: String, password: String, maxPool: Int = 4, minIdle: Int = 1, connTimeoutMs: Long = 10000): DbRuntime =
@@ -148,15 +150,28 @@ def runMigrations(db: DbRuntime): Unit =
     .load()
     .migrate()
 
+// NOTE: magnum 1.3.1 cannot splice SQL fragments (an interpolated Frag becomes a bind
+// parameter), so the column lists below are repeated literally; the row mapping is the
+// single source of truth. Keep the SELECT lists in sync with PeerRow / PairRow.
+private[immichsync] type PeerRow = (Long, String, String, String, Boolean, Option[Int], Option[Double])
+
+private[immichsync] def peerFromRow(row: PeerRow): SyncPeer = row match {
+  case (id, name, baseUrl, apiKeyEnv, enabled, maxRemovalCount, maxRemovalFraction) =>
+    SyncPeer(id, name, baseUrl, apiKeyEnv, enabled, maxRemovalCount, maxRemovalFraction)
+}
+
 def loadEnabledPeers()(using DbCon): Vector[SyncPeer] =
   sql"""
-      SELECT id, name, base_url, api_key_env, enabled
+      SELECT id, name, base_url, api_key_env, enabled, max_removal_count, max_removal_fraction
       FROM sync_peer
       WHERE enabled = true
-    """.query[(Long, String, String, String, Boolean)].run().map {
-    case (id, name, baseUrl, apiKeyEnv, enabled) =>
-      SyncPeer(id, name, baseUrl, apiKeyEnv, enabled)
-  }
+    """.query[PeerRow].run().map(peerFromRow)
+
+def loadAllPeers()(using DbCon): Vector[SyncPeer] =
+  sql"""
+      SELECT id, name, base_url, api_key_env, enabled, max_removal_count, max_removal_fraction
+      FROM sync_peer
+    """.query[PeerRow].run().map(peerFromRow)
 
 private[immichsync] type PairRow = (Long, String, Long, String, Long, String, String, Boolean, Boolean, Boolean, Boolean, Option[Int], Option[Double], String)
 
@@ -188,16 +203,16 @@ def loadEnabledPairs(pairFilter: Option[String])(using DbCon): Vector[AlbumPair]
 
 // Only successful, non-dry runs establish a baseline: a dry run observes state but has
 // converged nothing, so diffing against it could produce removals that were never agreed.
+// Ordered by id (strictly insert-ordered), which is deterministic even when two runs
+// share a started_at timestamp; retention protection uses the same definition.
 def previousBaselineRunId(pairId: Long)(using DbCon): Option[Long] =
   sql"""
-      SELECT id
+      SELECT MAX(id)
       FROM sync_run
       WHERE pair_id = $pairId
       AND status = 'success'
       AND dry_run = false
-      ORDER BY started_at DESC
-      LIMIT 1
-    """.query[Long].run().headOption
+    """.query[Option[Long]].run().headOption.flatten
 
 def loadRunObservations(runId: Long, side: String)(using DbCon): Vector[ObservationRow] =
   sql"""
@@ -338,11 +353,12 @@ def insertDeletionLog(
       VALUES ($runId, $pairId, $peerId, $albumId, $assetId, $checksum, $action, now())
     """.update.run()
 
-def updatePairQuarantined(pairId: Long, reason: String)(using DbTx): Unit =
+def updatePairQuarantined(pairId: Long, reason: String, rearmKey: String)(using DbTx): Unit =
   sql"""
       UPDATE album_pair
       SET quarantined_at = now(),
           quarantine_reason = $reason,
+          rearm_key = $rearmKey,
           updated_at = now()
       WHERE id = $pairId
     """.update.run()
@@ -355,24 +371,66 @@ def updatePairForceAdditive(pairId: Long, forceAdditive: Boolean)(using DbTx): U
       WHERE id = $pairId
     """.update.run()
 
-def rearmPair(name: String)(using DbTx): Int =
-  sql"""
-      UPDATE album_pair
-      SET quarantined_at = NULL,
-          quarantine_reason = NULL,
-          force_additive = TRUE,
-          updated_at = now()
-      WHERE name = $name
-    """.update.run()
-
-def rearmTombstones(name: String)(using DbTx): Int =
+private def rearmTombstonesByPairId(pairId: Long)(using DbTx): Int =
   sql"""
       UPDATE tombstone
       SET resolution = 'rearmed',
           resolved_at = now()
       WHERE resolved_at IS NULL
-      AND pair_id IN (SELECT id FROM album_pair WHERE name = $name)
+      AND pair_id = $pairId
     """.update.run()
+
+private def rearmPairById(pairId: Long)(using DbTx): Unit =
+  sql"""
+      UPDATE album_pair
+      SET quarantined_at = NULL,
+          quarantine_reason = NULL,
+          rearm_key = NULL,
+          force_additive = TRUE,
+          updated_at = now()
+      WHERE id = $pairId
+    """.update.run()
+
+// CLI re-arm by pair name. Returns (pairs re-armed, tombstones cleared).
+def rearmPairByName(name: String)(using DbTx): (Int, Int) =
+  sql"SELECT id FROM album_pair WHERE name = $name".query[Long].run().headOption match {
+    case None => (0, 0)
+    case Some(pairId) =>
+      val tombstones = rearmTombstonesByPairId(pairId)
+      rearmPairById(pairId)
+      (1, tombstones)
+  }
+
+// One-shot re-arm by key (IMMICH_SYNC_REARM). Returns the re-armed pair's name, or
+// None if the key is unknown or already consumed.
+def rearmByKey(key: String)(using DbTx): Option[String] =
+  sql"""
+      SELECT id, name FROM album_pair WHERE rearm_key = $key AND quarantined_at IS NOT NULL
+    """.query[(Long, String)].run().headOption.map { (pairId, name) =>
+    rearmTombstonesByPairId(pairId)
+    rearmPairById(pairId)
+    name
+  }
+
+// Crash-artifact repair: a previous process that died mid-run leaves status='running'
+// rows behind forever (they are excluded from audit pruning). Not sync state: safe to
+// run unconditionally at startup under the single-writer assumption.
+def markAbandonedRuns()(using DbTx): Int =
+  sql"""
+      UPDATE sync_run
+      SET status = 'aborted',
+          message = 'process terminated before the run finished',
+          finished_at = now()
+      WHERE status = 'running'
+    """.update.run()
+
+def selectQuarantinedPairs()(using DbCon): Vector[(String, Option[String], Option[String])] =
+  sql"""
+      SELECT name, quarantine_reason, rearm_key
+      FROM album_pair
+      WHERE quarantined_at IS NOT NULL
+      ORDER BY name
+    """.query[(String, Option[String], Option[String])].run()
 
 // ---------------------------------------------------------------------------
 // Sync groups & membership (surrogate keys; annotation token / album UUID are
@@ -427,8 +485,9 @@ def countSyncGroups()(using DbCon): Long =
 // ---------------------------------------------------------------------------
 
 def pruneObservations(pairId: Long, keepRuns: Int)(using DbTx): Int =
-  // The subquery keeps the newest K runs per pair; the baseline (newest successful
-  // apply run) is by definition among them since it is a run of this pair.
+  // Keeps the newest K runs per pair AND, unconditionally, the baseline run (newest
+  // successful non-dry run): dry or failed runs in between must never be able to push
+  // the baseline's observations out of the retention window.
   sql"""
       DELETE FROM asset_observation
       WHERE pair_id = $pairId
@@ -438,6 +497,12 @@ def pruneObservations(pairId: Long, keepRuns: Int)(using DbTx): Int =
         ORDER BY started_at DESC
         LIMIT $keepRuns
       )
+      AND run_id NOT IN (
+        SELECT MAX(id) FROM sync_run
+        WHERE pair_id = $pairId
+        AND status = 'success'
+        AND dry_run = false
+      )
     """.update.run()
 
 def pruneAuditData(retentionDays: Int)(using DbTx): (Int, Int) =
@@ -446,7 +511,8 @@ def pruneAuditData(retentionDays: Int)(using DbTx): (Int, Int) =
     // Cutoff bound as a plain timestamp for PostgreSQL/H2 portability.
     val cutoff = java.time.OffsetDateTime.now().minusDays(retentionDays.toLong)
     // Old runs go (cascading their events and any leftover observations), except each
-    // pair's current baseline run and anything still running.
+    // pair's current baseline run (same definition as previousBaselineRunId: highest-id
+    // successful non-dry run) and anything still running.
     val runs =
       sql"""
           DELETE FROM sync_run

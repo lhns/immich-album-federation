@@ -32,6 +32,10 @@ services:
       # Preview mode: logs what would happen without writing anything.
       # Set to "false" once the plan looks right.
       DRY_RUN: "true"
+      # Re-arm after a circuit-breaker quarantine: paste the one-shot rearm key from
+      # the logs (comma-separate several) and run `docker compose up -d`. The key is
+      # consumed on use, so leaving this set is harmless.
+      #IMMICH_SYNC_REARM: <rearm-key-from-logs>
       # Public peer hostnames must be allowlisted (private/LAN addresses are
       # allowed automatically).
       IMMICH_SYNC_ALLOWED_HOSTS: immich.example.org,immich.example.net

@@ -146,9 +146,18 @@ warning, and the photo is protected from being copied back to the side that dele
   full one gets filled, never the other way around.
 - **API failures can never look like an empty album**: a failed fetch fails the run and
   records nothing.
-- **Mass-removal circuit breaker**: losing more than `IMMICH_SYNC_MAX_REMOVALS`
-  (default 25) or `IMMICH_SYNC_MAX_REMOVAL_FRACTION` (default 30%) of a baseline in one
-  run quarantines the pair — nothing is applied until you `--rearm=<pair-name>`.
+- **Mass-removal circuit breaker**: losing more than the allowed number or fraction of
+  a baseline in one run quarantines the pair — nothing is applied until it is re-armed.
+  Thresholds resolve per side: pair override → per-server override (`maxRemovalCount`
+  / `maxRemovalFraction` on the peer in `sync.yaml`) → global env defaults
+  (`IMMICH_SYNC_MAX_REMOVALS` 25, `IMMICH_SYNC_MAX_REMOVAL_FRACTION` 0.3).
+  When it trips, the log prints a one-shot **rearm key** (also listed again on every
+  restart). Re-arming in docker: paste the key into `IMMICH_SYNC_REARM` (comma-separate
+  several) and `docker compose up -d` — the key is consumed on use and a new trip
+  issues a new key, so a leftover variable is harmless. Standalone: `--rearm=<pair-name>`
+  (repeatable). A re-armed pair restarts with a safe additive baseline.
+- **Server-level pause**: set `enabled: false` on a peer in `sync.yaml` — all its pairs
+  are skipped (not unlinked) until you re-enable it.
 - With `deletes=off`, removals are *suppressed*, not mirrored: the photo stays on the
   other side but is not copied back either (a tombstone remembers the removal until the
   photo is deliberately re-added).
@@ -169,9 +178,10 @@ sbt assembly                                    # build a runnable fat jar
 ```
 
 Without `IMMICH_SYNC_INTERVAL` the tool runs one reconciliation and exits (cron-style);
-with it (e.g. `15m`) it loops as a long-running service. Environment variables are
-documented in `doc/sync.local.env.example`. Migrations run automatically (Flyway,
-bundled in the jar).
+with it (e.g. `15m`) it loops as a long-running service. The config file is read once
+at startup, so changes to `sync.yaml` (new peers, `enabled: false`, thresholds) take
+effect on the next restart. Environment variables are documented in
+`doc/sync.local.env.example`. Migrations run automatically (Flyway, bundled in the jar).
 
 ## State, audit, and retention
 

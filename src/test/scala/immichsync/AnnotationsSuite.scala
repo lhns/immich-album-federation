@@ -156,6 +156,14 @@ class AnnotationsSuite extends munit.FunSuite:
     assert(plan.warnings.exists(_.contains("using the first")))
   }
 
+  test("discovery: group tokens are case-insensitive") {
+    val plan = planDiscovery(peers, Map(
+      1L -> Seq(album("album-a", "A", "[sync Family]")),
+      2L -> Seq(album("album-b", "B", "[sync family]")),
+    ))
+    assertEquals(plan.links.size, 1)
+  }
+
   test("discovery: same-peer albums can form a group") {
     val plan = planDiscovery(peers, Map(
       1L -> Seq(album("album-a", "A", "[sync local]"), album("album-b", "B", "[sync local]")),
@@ -191,23 +199,23 @@ class AnnotationsSuite extends munit.FunSuite:
     )
 
   test("reconcile: new link is inserted") {
-    val rec = reconcilePairs(Vector.empty, Seq(link))
+    val rec = reconcilePairs(Vector.empty, Seq(link), scannedPeerIds = Set(1L, 2L))
     assertEquals(rec.inserts, Seq(link))
     assert(rec.updates.isEmpty && rec.disables.isEmpty)
   }
 
   test("reconcile: unchanged link needs no action") {
-    val rec = reconcilePairs(Vector(annotationPair(5L)), Seq(link))
+    val rec = reconcilePairs(Vector(annotationPair(5L)), Seq(link), scannedPeerIds = Set(1L, 2L))
     assert(rec.inserts.isEmpty && rec.updates.isEmpty && rec.disables.isEmpty)
   }
 
   test("reconcile: changed config updates the pair") {
-    val rec = reconcilePairs(Vector(annotationPair(5L, propagateDeletes = false)), Seq(link))
+    val rec = reconcilePairs(Vector(annotationPair(5L, propagateDeletes = false)), Seq(link), scannedPeerIds = Set(1L, 2L))
     assertEquals(rec.updates, Seq(PairUpdate(5L, "bidirectional", true, reenable = false)))
   }
 
   test("reconcile: disabled pair is re-enabled with force_additive") {
-    val rec = reconcilePairs(Vector(annotationPair(5L, enabled = false)), Seq(link))
+    val rec = reconcilePairs(Vector(annotationPair(5L, enabled = false)), Seq(link), scannedPeerIds = Set(1L, 2L))
     assertEquals(rec.updates, Seq(PairUpdate(5L, "bidirectional", true, reenable = true)))
   }
 
@@ -215,14 +223,23 @@ class AnnotationsSuite extends munit.FunSuite:
     val rec = reconcilePairs(
       Vector(annotationPair(5L), annotationPair(6L, linkSource = "manual")),
       Seq.empty,
+      scannedPeerIds = Set(1L, 2L),
     )
     assertEquals(rec.disables, Seq(5L))
+  }
+
+  test("reconcile: pairs of unscanned peers are never disabled") {
+    // Peer 2 is disabled or unreachable: its albums were not scanned, so the vanished
+    // membership must not be interpreted as unlinking.
+    val rec = reconcilePairs(Vector(annotationPair(5L)), Seq.empty, scannedPeerIds = Set(1L))
+    assert(rec.disables.isEmpty)
   }
 
   test("reconcile: manual pair with matching endpoints is left alone") {
     val rec = reconcilePairs(
       Vector(annotationPair(6L, mode = "left_to_right", linkSource = "manual")),
       Seq(link),
+      scannedPeerIds = Set(1L, 2L),
     )
     assert(rec.inserts.isEmpty && rec.updates.isEmpty && rec.disables.isEmpty)
     assert(rec.warnings.exists(_.contains("manually configured")))
@@ -242,7 +259,7 @@ class AnnotationsSuite extends munit.FunSuite:
       linkSource = "annotation",
     )
     val oneWay = link.copy(mode = "left_to_right")
-    val rec = reconcilePairs(Vector(flippedPair), Seq(oneWay))
+    val rec = reconcilePairs(Vector(flippedPair), Seq(oneWay), scannedPeerIds = Set(1L, 2L))
     assertEquals(rec.updates, Seq(PairUpdate(7L, "right_to_left", true, reenable = false)))
     assert(rec.disables.isEmpty)
   }
@@ -263,7 +280,7 @@ class AnnotationsSuite extends munit.FunSuite:
 
     def discover(gen: () => String): (DiscoveryPlan, PairReconciliation) =
       val plan = planDiscovery(peers, Map(1L -> albumsOne, 2L -> albumsTwo), gen)
-      val rec = reconcilePairs(pairRows, plan.links)
+      val rec = reconcilePairs(pairRows, plan.links, scannedPeerIds = Set(1L, 2L))
       // Apply reconciliation to the simulated pair table (what runAnnotationDiscovery does in the DB).
       rec.inserts.foreach { l =>
         pairRows = pairRows :+ AlbumPair(
@@ -313,7 +330,7 @@ class AnnotationsSuite extends munit.FunSuite:
     assert(pair.forceAdditive)
     assert(pair.enabled)
 
-    // Runs 4-6: repeated discovery is idempotent — no new rows, no stamps, no churn.
+    // Runs 4-6: repeated discovery is idempotent â€” no new rows, no stamps, no churn.
     (1 to 3).foreach { _ =>
       val (planN, recN) = discover(tokenGen("unused"))
       assert(planN.autoAnnotations.isEmpty)

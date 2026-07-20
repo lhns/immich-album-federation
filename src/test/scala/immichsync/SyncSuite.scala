@@ -63,6 +63,7 @@ class InMemorySyncRepository extends SyncRepository:
   val uploadedAssets: mutable.ArrayBuffer[(Long, String, String)] = mutable.ArrayBuffer.empty // (peerId, assetId, checksum)
   val deletions: mutable.ArrayBuffer[DeletionRecord] = mutable.ArrayBuffer.empty
   val quarantined: mutable.Map[Long, String] = mutable.Map.empty
+  val rearmKeys: mutable.Map[Long, String] = mutable.Map.empty
   val forceAdditiveCleared: mutable.Set[Long] = mutable.Set.empty
 
   def seedTombstone(pairId: Long, originSide: String, assetId: String, checksum: String): Unit = synchronized {
@@ -157,8 +158,9 @@ class InMemorySyncRepository extends SyncRepository:
     deletions += DeletionRecord(runId, pairId, peerId, albumId, assetId, checksum, action)
   }
 
-  override def markQuarantined(pairId: Long, reason: String): Unit = synchronized {
+  override def markQuarantined(pairId: Long, reason: String, rearmKey: String): Unit = synchronized {
     quarantined.put(pairId, reason)
+    rearmKeys.put(pairId, rearmKey)
   }
 
   override def finalizeRun(
@@ -168,7 +170,7 @@ class InMemorySyncRepository extends SyncRepository:
       resolutions: Seq[TombstoneResolutionPlan],
       observationsLeft: Seq[ObservationRow],
       observationsRight: Seq[ObservationRow],
-      clearForceAdditive: Boolean,
+      applyRun: Boolean,
       observationKeepRuns: Int = RetentionConfig.Default.observationKeepRuns,
   ): Unit = synchronized {
     tombstoneWrites.foreach { write =>
@@ -199,17 +201,21 @@ class InMemorySyncRepository extends SyncRepository:
     observationsRight.foreach { row =>
       observations += ObservationRecord(runId, pair.id, "right", pair.rightAlbumId, row.assetId, row.checksum, row.isTrashed)
     }
-    if (clearForceAdditive && pair.forceAdditive) forceAdditiveCleared += pair.id
-    // Same retention rule as the DB repository: keep observations of the newest K runs.
-    val keepRunIds = runs.values.filter(_.pairId == pair.id).toVector.sortBy(-_.startedOrder).take(observationKeepRuns).map(_.id).toSet
-    observations.filterInPlace(o => o.pairId != pair.id || keepRunIds.contains(o.runId))
+    if (applyRun && pair.forceAdditive) forceAdditiveCleared += pair.id
+    // Same retention rule as the DB repository: only apply runs prune, keeping the
+    // newest K runs plus, unconditionally, the baseline run.
+    if (applyRun) {
+      val keepRunIds = runs.values.filter(_.pairId == pair.id).toVector.sortBy(-_.startedOrder).take(observationKeepRuns).map(_.id).toSet ++
+        findPreviousBaselineRunId(pair.id).toSet
+      observations.filterInPlace(o => o.pairId != pair.id || keepRunIds.contains(o.runId))
+    }
     completeRun(runId, "success", None)
   }
 
 // Fake Immich API; methods synchronized uniformly for parallel executor calls.
 final class FakeImmichApi extends ImmichApi:
   private val albumAssets: mutable.Map[(String, String), Seq[AssetResponseDto]] = mutable.Map.empty
-  private val bulkChecks: mutable.Map[String, Seq[BulkCheckResp[AssetResponseDto]]] = mutable.Map.empty
+  private val bulkChecks: mutable.Map[String, Seq[BulkCheckResp]] = mutable.Map.empty
   private val bytesByAssetId: mutable.Map[String, Array[Byte]] = mutable.Map.empty
   private val uploadResults: mutable.Queue[UploadResult] = mutable.Queue.empty
   private val albumFailures: mutable.Map[(String, String), Throwable] = mutable.Map.empty
@@ -230,7 +236,7 @@ final class FakeImmichApi extends ImmichApi:
     albumAssets.put((baseUrl, albumId), assets)
   }
 
-  def setBulkCheck(baseUrl: String, results: Seq[BulkCheckResp[AssetResponseDto]]): Unit = synchronized {
+  def setBulkCheck(baseUrl: String, results: Seq[BulkCheckResp]): Unit = synchronized {
     bulkChecks.put(baseUrl, results)
   }
 
@@ -285,7 +291,7 @@ final class FakeImmichApi extends ImmichApi:
     assetInfos.getOrElse(assetId, throw new RuntimeException(s"no asset info for $assetId"))
   }
 
-  override def assetBulkCheck(server: ImmichServer, assets: Seq[AssetResponseDto]): Seq[BulkCheckResp[AssetResponseDto]] = synchronized {
+  override def assetBulkCheck(server: ImmichServer, assets: Seq[AssetResponseDto]): Seq[BulkCheckResp] = synchronized {
     bulkChecks.getOrElse(server.baseUrl, assets.map(asset => BulkCheckResp(asset, None, false)))
   }
 
@@ -300,7 +306,7 @@ final class FakeImmichApi extends ImmichApi:
   override def albumRemoveAssets(album: Album, assetIds: Seq[String]): AlbumRemoveResult = synchronized {
     removeFromAlbumCalls += ((album.server.baseUrl, album.id, assetIds))
     val (skipped, removed) = assetIds.partition(nonRemovable.contains)
-    AlbumRemoveResult(removed, skipped.map(_ -> "no_permission"))
+    AlbumRemoveResult(removed = removed, skipped = skipped.map(_ -> "no_permission"))
   }
 
   override def albumsContainingAsset(server: ImmichServer, assetId: String): Seq[String] = synchronized {
@@ -373,10 +379,11 @@ class SyncSuite extends munit.FunSuite:
       leftAssets: Seq[AssetResponseDto] = Seq.empty,
       rightAssets: Seq[AssetResponseDto] = Seq.empty,
       activeTombstones: Vector[ActiveTombstone] = Vector.empty,
-      thresholds: Thresholds = Thresholds.Default,
+      thresholdsLeft: Thresholds = Thresholds.Default,
+      thresholdsRight: Thresholds = Thresholds.Default,
       forceAdditive: Boolean = false,
   ): MergeInput =
-    MergeInput(pair, baselineLeft, baselineRight, leftAssets, rightAssets, activeTombstones, thresholds, forceAdditive)
+    MergeInput(pair, baselineLeft, baselineRight, leftAssets, rightAssets, activeTombstones, thresholdsLeft, thresholdsRight, forceAdditive)
 
   // -------------------------------------------------------------------------
   // computeMergePlan
@@ -553,6 +560,30 @@ class SyncSuite extends munit.FunSuite:
     assertEquals(smallAlbum.tombstoneWrites.map(_.checksum), Seq("c3"))
   }
 
+  test("planner: circuit-breaker thresholds apply per side") {
+    val baseline = (1 to 5).map(i => obs(s"x$i", s"c$i")).toVector
+    val strict = Thresholds(maxRemovalCount = 0, maxRemovalFraction = 1.0)
+    val lax = Thresholds(maxRemovalCount = 100, maxRemovalFraction = 1.0)
+
+    // One removal on the LEFT with a strict left threshold quarantines...
+    val leftBreach = computeMergePlan(mkInput(
+      baselineLeft = baseline,
+      leftAssets = (1 to 4).map(i => mkAsset(s"x$i", s"c$i")),
+      thresholdsLeft = strict,
+      thresholdsRight = lax,
+    ))
+    assert(leftBreach.isQuarantined)
+
+    // ...while the same removal on the RIGHT is judged by the lax right threshold.
+    val rightSide = computeMergePlan(mkInput(
+      baselineRight = baseline,
+      rightAssets = (1 to 4).map(i => mkAsset(s"x$i", s"c$i")),
+      thresholdsLeft = strict,
+      thresholdsRight = lax,
+    ))
+    assert(!rightSide.isQuarantined)
+  }
+
   test("planner: one-way mode gates copies and removal propagation") {
     val pair = basePair.copy(mode = "left_to_right", propagateDeletes = true)
     val rightOnly = mkAsset("rO", "cO")
@@ -574,6 +605,24 @@ class SyncSuite extends munit.FunSuite:
     assert(!plan.copyLeftToRight.exists(_.checksum == "cY"))
     val rightTombstone = plan.tombstoneWrites.filter(_.originSide == "right")
     assertEquals(rightTombstone.map(w => (w.checksum, w.resolution)), Seq(("cY", None)))
+  }
+
+  test("planner: add-wins holds in one-way mode, the receiver's fresh add is never deleted") {
+    val pair = basePair.copy(mode = "left_to_right", propagateDeletes = true)
+    val freshRight = mkAsset("rX", "cX")
+    val plan = computeMergePlan(mkInput(
+      pair = pair,
+      baselineLeft = Vector(obs("lX", "cX")),
+      baselineRight = Vector.empty,
+      leftAssets = Seq.empty,
+      rightAssets = Seq(freshRight), // freshly added on the right THIS run
+    ))
+
+    // Left removed cX, but the right just added it natively: no removal, and (flow
+    // right->left being disabled) no copy back either; the tombstone stays active.
+    assert(plan.removeFromRight.isEmpty)
+    assert(plan.copyRightToLeft.isEmpty)
+    assertEquals(plan.tombstoneWrites.map(w => (w.originSide, w.checksum, w.resolution)), Seq(("left", "cX", None)))
   }
 
   test("planner: trashed asset counts as removal tagged via_trash") {
@@ -639,7 +688,7 @@ class SyncSuite extends munit.FunSuite:
       resolutions = Seq.empty,
       observationsLeft = left.map(a => ObservationRow(a.id, a.checksum, a.isTrashed)),
       observationsRight = right.map(a => ObservationRow(a.id, a.checksum, a.isTrashed)),
-      clearForceAdditive = false,
+      applyRun = true,
     )
 
   test("executor: write-enabled add flow untrashes, uploads, adds to album and records provenance") {
@@ -798,6 +847,74 @@ class SyncSuite extends munit.FunSuite:
     assert(api.addToAlbumCalls.isEmpty)
   }
 
+  test("executor: trashing a live photo still also reclaims its motion video") {
+    val repo = InMemorySyncRepository()
+    val api = FakeImmichApi()
+    val pair = basePair.copy(propagateDeletes = true)
+
+    val goneLeft = mkAsset("l-gone", "chk-still")
+    val stillRight = mkAsset("r-still", "chk-still").copy(livePhotoVideoId = Some("r-video"))
+    val videoRight = mkAsset("r-video", "chk-video")
+
+    seedBaseline(repo, pair, Seq(goneLeft), Seq(stillRight))
+    repo.seedUploadedAsset(rightPeer.id, stillRight.id, stillRight.checksum)
+    repo.seedUploadedAsset(rightPeer.id, videoRight.id, videoRight.checksum)
+    api.setAssetInfo(videoRight)
+
+    api.setAlbumAssets(leftPeer.baseUrl, pair.leftAlbumId, Seq.empty)
+    api.setAlbumAssets(rightPeer.baseUrl, pair.rightAlbumId, Seq(stillRight))
+
+    runSync(repo, api, pair)
+
+    assertEquals(api.trashCalls.head._2.toSet, Set(stillRight.id, videoRight.id))
+    assertEquals(repo.deletions.filter(_.action == "trash").map(_.assetId).toSet, Set(stillRight.id, videoRight.id))
+  }
+
+  test("executor: dry run downloads and uploads nothing while previewing the full plan") {
+    val repo = InMemorySyncRepository()
+    val api = FakeImmichApi()
+    val pair = basePair.copy(mode = "left_to_right", forceAdditive = true)
+
+    api.setAlbumAssets(leftPeer.baseUrl, pair.leftAlbumId, Seq(mkAsset("l1", "c1"), mkAsset("l2", "c2")))
+    api.setAlbumAssets(rightPeer.baseUrl, pair.rightAlbumId, Seq.empty)
+
+    runSync(repo, api, pair, applyWrites = false)
+
+    // The plan was walked (event reports the would-be uploads) but no bytes moved.
+    assert(api.assetGetCalls.isEmpty)
+    assert(api.uploadCalls.isEmpty)
+    assert(api.addToAlbumCalls.isEmpty)
+    assert(repo.uploadedAssets.isEmpty)
+    val event = repo.events.find(_.eventType == "direction_sync").get
+    assert(event.payloadText.contains("\"uploaded\":2"))
+    assert(event.payloadText.contains("\"apply_writes\":false"))
+  }
+
+  test("executor: dry runs never prune the baseline observations") {
+    val repo = InMemorySyncRepository()
+    val api = FakeImmichApi()
+    val pair = basePair
+    val retention = RetentionConfig(observationKeepRuns = 2, auditRetentionDays = 90)
+
+    val left = Seq(mkAsset("l1", "c1"))
+    api.setAlbumAssets(leftPeer.baseUrl, pair.leftAlbumId, left)
+    api.setAlbumAssets(rightPeer.baseUrl, pair.rightAlbumId, Seq(mkAsset("r1", "c1")))
+
+    runSync(repo, api, pair, applyWrites = true, retention = retention)
+    val baselineRunId = repo.findPreviousBaselineRunId(pair.id).get
+
+    // Far more dry cycles than the retention window: the baseline must survive.
+    (1 to 5).foreach(_ => runSync(repo, api, pair, applyWrites = false, retention = retention))
+
+    assertEquals(repo.findPreviousBaselineRunId(pair.id), Some(baselineRunId))
+    assert(repo.getRunObservations(baselineRunId, "left").nonEmpty)
+
+    // The next apply run still detects removals against that baseline.
+    api.setAlbumAssets(leftPeer.baseUrl, pair.leftAlbumId, Seq.empty)
+    runSync(repo, api, pair, applyWrites = true, retention = retention)
+    assertEquals(repo.events.count(_.eventType == "removal_detected"), 1)
+  }
+
   test("executor: no trash without provenance, favorites and archived are protected") {
     val repo = InMemorySyncRepository()
     val api = FakeImmichApi()
@@ -907,6 +1024,8 @@ class SyncSuite extends munit.FunSuite:
     val runId = repo.runs.keys.max
     assertEquals(repo.runs(runId).status, "quarantined")
     assertEquals(repo.quarantined.keySet, Set(pair.id))
+    // A one-shot rearm key was generated for the incident.
+    assert(repo.rearmKeys.get(pair.id).exists(_.nonEmpty))
     assert(api.removeFromAlbumCalls.isEmpty)
     assert(api.trashCalls.isEmpty)
     assert(api.uploadCalls.isEmpty)

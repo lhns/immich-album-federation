@@ -43,20 +43,22 @@ def computeMergePlan(in: MergeInput): MergePlan =
   val removalsL = baseL -- curL
   val removalsR = baseR -- curR
 
-  def breach(side: String, removals: Set[String], baseSize: Int): Option[String] =
-    if (removals.size > in.thresholds.maxRemovalCount)
-      Some(s"$side album lost ${removals.size} assets in one run (max ${in.thresholds.maxRemovalCount})")
+  def breach(side: String, removals: Set[String], baseSize: Int, thresholds: Thresholds): Option[String] =
+    if (removals.size > thresholds.maxRemovalCount)
+      Some(s"$side album lost ${removals.size} assets in one run (max ${thresholds.maxRemovalCount})")
     else if (
       removals.size >= Thresholds.FractionMinRemovals && baseSize > 0 &&
-      removals.size.toDouble / baseSize > in.thresholds.maxRemovalFraction
+      removals.size.toDouble / baseSize > thresholds.maxRemovalFraction
     )
       Some(
         s"$side album lost ${removals.size} of $baseSize assets " +
-          s"(${math.round(removals.size.toDouble / baseSize * 100)}% > ${math.round(in.thresholds.maxRemovalFraction * 100)}%)"
+          s"(${math.round(removals.size.toDouble / baseSize * 100)}% > ${math.round(thresholds.maxRemovalFraction * 100)}%)"
       )
     else None
 
-  val quarantineReason = breach("left", removalsL, baseL.size).orElse(breach("right", removalsR, baseR.size))
+  val quarantineReason =
+    breach("left", removalsL, baseL.size, in.thresholdsLeft)
+      .orElse(breach("right", removalsR, baseR.size, in.thresholdsRight))
   if (quarantineReason.isDefined) MergePlan.quarantined(quarantineReason.get)
   else {
     // Lifecycle of persisted (active) tombstones.
@@ -86,7 +88,13 @@ def computeMergePlan(in: MergeInput): MergePlan =
     ): Seq[TombstoneWrite] =
       removals.toSeq.sorted.flatMap { checksum =>
         val resolution =
-          if (otherAdds.contains(checksum) && flowOtherToOrigin) Some("add_wins")
+          if (otherAdds.contains(checksum)) {
+            // Add-wins holds in every mode: a photo freshly added on the other side is
+            // never deleted by a concurrent removal. When the other->origin flow is
+            // enabled it is copied back (add_wins); otherwise the removal is simply
+            // suppressed and the other side keeps its photo.
+            if (flowOtherToOrigin) Some("add_wins") else None
+          }
           else if (!otherCur.contains(checksum)) Some("converged")
           else if (in.pair.propagateDeletes && flowOriginToOther) Some("propagated")
           else None

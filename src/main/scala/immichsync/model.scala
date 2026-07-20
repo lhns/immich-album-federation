@@ -2,7 +2,7 @@ package immichsync
 
 import com.augustnagro.magnum.Transactor
 import com.zaxxer.hikari.HikariDataSource
-import upickle.default.{macroRW, ReadWriter as RW}
+import upickle.default.ReadWriter as RW
 
 case class ImmichServer(baseUrl: String, apiKey: String) {
   def apiBaseUrl = s"$baseUrl/api"
@@ -18,6 +18,8 @@ case class SyncPeer(
   baseUrl: String,
   apiKeyEnv: String,
   enabled: Boolean,
+  maxRemovalCount: Option[Int] = None,
+  maxRemovalFraction: Option[Double] = None,
 )
 
 case class AlbumPair(
@@ -41,7 +43,7 @@ case class CliConfig(
   dryRun: Boolean,
   pairFilter: Option[String],
   extraAllowedHosts: Set[String],
-  rearmPair: Option[String],
+  rearmPairs: List[String],
   discoverOnly: Boolean,
   configFile: Option[String],
 )
@@ -69,7 +71,7 @@ object RetentionConfig {
 
 case class DbRuntime(dataSource: HikariDataSource, xa: Transactor)
 
-case class BulkCheckResp[A](asset: A, assetId: Option[String], isTrashed: Boolean)
+case class BulkCheckResp(asset: AssetResponseDto, assetId: Option[String], isTrashed: Boolean)
 
 case class UploadResult(id: String, status: String) {
   def created: Boolean = status == "created"
@@ -77,7 +79,13 @@ case class UploadResult(id: String, status: String) {
 
 // Result of a best-effort album removal: the sync user may lack permission to remove
 // assets that the album owner added natively (only owners can remove others' assets).
-case class AlbumRemoveResult(removed: Seq[String], skipped: Seq[(String, String)])
+// removed = actually removed; missing = already gone (not_found, effectively removed
+// but no action was performed); skipped = permission or unknown per-id errors.
+case class AlbumRemoveResult(
+  removed: Seq[String],
+  missing: Seq[String] = Seq.empty,
+  skipped: Seq[(String, String)] = Seq.empty,
+)
 
 case class ObservationRow(assetId: String, checksum: String, isTrashed: Boolean)
 
@@ -100,7 +108,8 @@ case class MergeInput(
   leftAssets: Seq[AssetResponseDto],
   rightAssets: Seq[AssetResponseDto],
   activeTombstones: Vector[ActiveTombstone],
-  thresholds: Thresholds,
+  thresholdsLeft: Thresholds,
+  thresholdsRight: Thresholds,
   forceAdditive: Boolean,
 )
 
@@ -133,7 +142,6 @@ case class AssetUploadRequest(
   isFavorite: Option[Boolean] = None,
   livePhotoVideoId: Option[String] = None,
   visibility: Option[String] = None,
-  sidecarData: Option[Array[Byte]] = None,
 )
 
 object AssetUploadRequest {

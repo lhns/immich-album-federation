@@ -34,6 +34,8 @@ case class PeerConfig(
   baseUrl: String,
   apiKeyEnv: String,
   enabled: Option[Boolean] = None,
+  maxRemovalCount: Option[Int] = None,
+  maxRemovalFraction: Option[Double] = None,
 ) derives YamlCodec
 
 case class PairEndpointConfig(peer: String, album: String) derives YamlCodec
@@ -68,10 +70,20 @@ def validateSyncConfig(config: SyncConfig): Seq[String] =
   config.peers.filter(p => p.name.isEmpty || p.baseUrl.isEmpty || p.apiKeyEnv.isEmpty)
     .foreach(p => errors += s"peer '${p.name}' has empty name, baseUrl or apiKeyEnv")
 
+  config.peers.foreach { peer =>
+    peer.maxRemovalFraction.foreach { f =>
+      if (f <= 0 || f > 1) errors += s"peer '${peer.name}' has invalid maxRemovalFraction $f"
+    }
+    peer.maxRemovalCount.foreach { c =>
+      if (c < 0) errors += s"peer '${peer.name}' has invalid maxRemovalCount $c"
+    }
+  }
+
   val peerNames = config.peers.map(_.name.toLowerCase).toSet
   val duplicatePairNames = config.allPairs.groupBy(_.name).filter(_._2.size > 1).keys
   duplicatePairNames.foreach(n => errors += s"duplicate pair name '$n'")
   config.allPairs.foreach { pair =>
+    if (pair.name.trim.isEmpty) errors += "a pair has an empty name"
     Seq(pair.left, pair.right).foreach { endpoint =>
       if (!peerNames.contains(endpoint.peer.toLowerCase))
         errors += s"pair '${pair.name}' references unknown peer '${endpoint.peer}'"
@@ -83,6 +95,9 @@ def validateSyncConfig(config: SyncConfig): Seq[String] =
     }
     pair.maxRemovalFraction.foreach { f =>
       if (f <= 0 || f > 1) errors += s"pair '${pair.name}' has invalid maxRemovalFraction $f"
+    }
+    pair.maxRemovalCount.foreach { c =>
+      if (c < 0) errors += s"pair '${pair.name}' has invalid maxRemovalCount $c"
     }
   }
   errors.result()
@@ -104,31 +119,27 @@ def loadSyncConfigFile(path: String): SyncConfig =
 // DB application
 // ---------------------------------------------------------------------------
 
-def loadAllPeers()(using DbCon): Vector[SyncPeer] =
-  sql"""
-      SELECT id, name, base_url, api_key_env, enabled
-      FROM sync_peer
-    """.query[(Long, String, String, String, Boolean)].run().map {
-    case (id, name, baseUrl, apiKeyEnv, enabled) =>
-      SyncPeer(id, name, baseUrl, apiKeyEnv, enabled)
-  }
-
 // Update-then-insert instead of ON CONFLICT DO UPDATE: H2 (PG mode) supports only
 // DO NOTHING, and the tool is single-writer so the pattern is race-free in practice.
+// Name matching is case-insensitive (consistent with peersByName lookups): changing
+// the case in the config updates the same row instead of forking a second peer.
 def upsertPeer(peer: PeerConfig)(using DbTx): Unit =
   val enabled = peer.enabled.getOrElse(true)
   val updated =
     sql"""
         UPDATE sync_peer
-        SET base_url = ${peer.baseUrl},
+        SET name = ${peer.name},
+            base_url = ${peer.baseUrl},
             api_key_env = ${peer.apiKeyEnv},
-            enabled = $enabled
-        WHERE name = ${peer.name}
+            enabled = $enabled,
+            max_removal_count = ${peer.maxRemovalCount},
+            max_removal_fraction = ${peer.maxRemovalFraction}
+        WHERE LOWER(name) = LOWER(${peer.name})
       """.update.run()
   if (updated == 0) {
     sql"""
-        INSERT INTO sync_peer(name, base_url, api_key_env, enabled)
-        VALUES (${peer.name}, ${peer.baseUrl}, ${peer.apiKeyEnv}, $enabled)
+        INSERT INTO sync_peer(name, base_url, api_key_env, enabled, max_removal_count, max_removal_fraction)
+        VALUES (${peer.name}, ${peer.baseUrl}, ${peer.apiKeyEnv}, $enabled, ${peer.maxRemovalCount}, ${peer.maxRemovalFraction})
       """.update.run()
   }
 

@@ -20,6 +20,6 @@ COPY --from=build /build/target/scala-3.7.3/app.jar /app/app.jar
 
 # Configuration comes from environment variables (see doc/sync.local.env.example) and
 # an optional mounted config file, e.g.:
-#   docker run --env-file sync.env -v ./sync.yaml:/app/sync.yaml \
-#     ghcr.io/lhns/immich-album-federation --config=/app/sync.yaml --apply
+#   docker run --env-file sync.env -e DRY_RUN=true -v ./sync.yaml:/app/sync.yaml \
+#     ghcr.io/lhns/immich-album-federation --config=/app/sync.yaml
 ENTRYPOINT ["java", "-jar", "/app/app.jar"]
