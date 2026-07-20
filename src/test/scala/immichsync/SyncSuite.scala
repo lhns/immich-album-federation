@@ -718,9 +718,11 @@ class SyncSuite extends munit.FunSuite:
     assertEquals(api.assetGetCalls.size, 1)
     assertEquals(api.assetGetCalls.head._2, source2.id)
 
-    // Untrashed assets are re-added to the album as well.
-    assertEquals(api.addToAlbumCalls.size, 1)
-    assertEquals(api.addToAlbumCalls.head._2.toSet, Set("target-uploaded", "target-existing", "target-trashed"))
+    // Already-present assets (incl. the untrashed one) are batch-added FIRST so they
+    // appear in the album immediately; each upload is added right after it completes.
+    assertEquals(api.addToAlbumCalls.size, 2)
+    assertEquals(api.addToAlbumCalls.head._2.toSet, Set("target-existing", "target-trashed"))
+    assertEquals(api.addToAlbumCalls(1)._2, Seq("target-uploaded"))
 
     // Provenance recorded only for the freshly created upload, on the target peer.
     assertEquals(repo.uploadedAssets.toList, List((rightPeer.id, "target-uploaded", "chk-2")))
@@ -1111,6 +1113,43 @@ class SyncSuite extends munit.FunSuite:
 
     runSync(repo, api, pair, applyWrites = true)
     assertEquals(repo.forceAdditiveCleared.toSet, Set(pair.id))
+  }
+
+  test("transfer progress emits at most one line per interval and none at completion") {
+    val lines = scala.collection.mutable.ArrayBuffer.empty[String]
+    var t = 0L
+    val progress = new TransferProgress("[pair=p] left_to_right:", total = 3, intervalNanos = 10, log = lines += _, now = () => t)
+    progress.tick(1024)          // elapsed 0 < interval: silent
+    t = 15; progress.tick(1024)  // interval passed: logs running total
+    t = 40; progress.tick(512)   // last tick (done == total): silent, the summary event follows anyway
+    assertEquals(lines.toList, List("[pair=p] left_to_right: uploaded 2/3 (2.0 KiB)"))
+    assertEquals(TransferProgress.humanBytes(5L * 1024 * 1024 * 1024 / 2), "2.5 GiB")
+  }
+
+  test("endpoint locks serialize pairs sharing an album and allow disjoint concurrency") {
+    val locks = new EndpointLocks
+    val active = java.util.concurrent.atomic.AtomicInteger(0)
+    val maxActive = java.util.concurrent.atomic.AtomicInteger(0)
+    def task(endpoints: Seq[(Long, String)]): Unit =
+      locks.withLocks(endpoints) {
+        val a = active.incrementAndGet()
+        maxActive.updateAndGet(m => math.max(m, a))
+        Thread.sleep(20)
+        active.decrementAndGet()
+      }
+
+    // A-B and A-C share album A: never concurrent, regardless of scheduling.
+    parMap(Seq(Seq(1L -> "album-a", 2L -> "album-b"), Seq(1L -> "album-a", 3L -> "album-c")), 2)(task)
+    assertEquals(maxActive.get(), 1)
+
+    // Disjoint pairs genuinely overlap: both must be inside their locks at once.
+    val bothInside = java.util.concurrent.CountDownLatch(2)
+    parMap(Seq(1L, 2L), 2) { i =>
+      locks.withLocks(Seq(i -> "album-x")) {
+        bothInside.countDown()
+        assert(bothInside.await(2, java.util.concurrent.TimeUnit.SECONDS), "disjoint pairs were serialized")
+      }
+    }
   }
 
   test("executor: observation retention keeps rows bounded to K runs") {

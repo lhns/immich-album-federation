@@ -193,11 +193,15 @@ def main(args: String*): Unit =
         // pause) are skipped, not disabled: they resume untouched when re-enabled.
         val (runnable, skipped) = pairs.partition(p => peerById.contains(p.leftPeerId) && peerById.contains(p.rightPeerId))
         skipped.foreach(p => println(s"[pair=${p.name}] skipped: peer disabled or missing"))
+        // Pairs sharing an album endpoint (same-instance groups) serialize on it;
+        // disjoint pairs run in parallel. The same pair can never overlap with itself:
+        // cycles are sequential (the interval sleep starts after all pairs joined).
+        val endpointLocks = new EndpointLocks
         parMap(runnable, pairConcurrency) { pair =>
           val leftPeer = peerById(pair.leftPeerId)
           val rightPeer = peerById(pair.rightPeerId)
 
-          try {
+          try endpointLocks.withLocks(Seq(pair.leftPeerId -> pair.leftAlbumId, pair.rightPeerId -> pair.rightAlbumId)) {
             executePairSync(
               db = db,
               api = api,

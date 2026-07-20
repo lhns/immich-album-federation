@@ -27,11 +27,23 @@ def applyAdds(
     val (existingResults, nonExistingResults) = bulkCheckResults.partition(_.assetId.isDefined)
     val toUntrash = existingResults.filter(_.isTrashed).flatMap(_.assetId)
 
+    println(
+      s"[pair=${pair.name}] $direction: ${nonExistingResults.size} to upload, " +
+        s"${existingResults.size - toUntrash.size} already present, ${toUntrash.size} to restore from trash"
+    )
+
     if (toUntrash.nonEmpty) {
       api.untrash(targetServer, toUntrash)
     }
 
-    def uploadOne(dto: AssetResponseDto, livePhotoVideoId: Option[String]): UploadResult =
+    // Assets that already exist on the target become visible in the album right away;
+    // uploads are added one by one as they complete (see below).
+    val existingIds = existingResults.flatMap(_.assetId)
+    if (existingIds.nonEmpty) {
+      api.albumAddAssets(targetAlbum, existingIds)
+    }
+
+    def uploadOne(dto: AssetResponseDto, livePhotoVideoId: Option[String]): (UploadResult, Long) =
       val bytes = api.assetGet(sourceServer, dto.id)
       val uploadRequest = AssetUploadRequest
         .fromAssetResponseDto(dto, bytes)
@@ -42,22 +54,26 @@ def applyAdds(
       if (result.created) {
         repo.recordUploadedAsset(runId, pair.id, targetPeerId, result.id, dto.checksum)
       }
-      result
+      (result, bytes.length.toLong)
 
+    val progress = new TransferProgress(s"[pair=${pair.name}] $direction:", nonExistingResults.size)
     val uploadedIds =
       parMap(nonExistingResults, transferConcurrency) { dto =>
         // Live photos: transfer the motion video first, then link the still to it.
-        val targetVideoId = dto.asset.livePhotoVideoId.map { videoId =>
-          val videoDto = api.assetInfo(sourceServer, videoId)
-          uploadOne(videoDto, livePhotoVideoId = None).id
-        }
-        uploadOne(dto.asset, livePhotoVideoId = targetVideoId).id
+        val (videoId, videoBytes) = dto.asset.livePhotoVideoId.map { sourceVideoId =>
+          val videoDto = api.assetInfo(sourceServer, sourceVideoId)
+          val (videoResult, bytes) = uploadOne(videoDto, livePhotoVideoId = None)
+          (Some(videoResult.id), bytes)
+        }.getOrElse((None, 0L))
+        val (result, stillBytes) = uploadOne(dto.asset, livePhotoVideoId = videoId)
+        // Immediately visible in the album; an interrupted run leaves a consistent,
+        // fully-synced prefix and continues via checksum dedup next cycle.
+        api.albumAddAssets(targetAlbum, Seq(result.id))
+        progress.tick(videoBytes + stillBytes)
+        result.id
       }
 
-    val addToAlbumIds = uploadedIds ++ existingResults.flatMap(_.assetId)
-    if (addToAlbumIds.nonEmpty) {
-      api.albumAddAssets(targetAlbum, addToAlbumIds)
-    }
+    val addToAlbumIds = uploadedIds ++ existingIds
 
     val payload = ujson.Obj(
       "candidates" -> candidates.size,
@@ -95,6 +111,7 @@ def applyRemovals(
 ): Set[String] =
   if (removals.isEmpty) Set.empty
   else {
+    println(s"[pair=${pair.name}] $direction: ${removals.size} removal(s) to apply")
     val byId = removals.map(a => a.id -> a).toMap
     val result = api.albumRemoveAssets(targetAlbum, removals.map(_.id))
 

@@ -100,7 +100,9 @@ opt-in and the security boundary:
    unlimited).
 2. Log in as that user → Account Settings → API Keys → create a key with permissions:
    `album.read`, `album.update`, `albumAsset.create`, `albumAsset.delete`,
-   `asset.read`, `asset.upload`, `asset.download`, `asset.delete`, `asset.update`.
+   `asset.read`, `asset.upload`, `asset.download`, `asset.delete`, `asset.update`,
+   `server.about` (used for the startup version check; without it the check degrades
+   to a logged warning).
 3. Put the key into that peer's `apiKey` in `sync.yaml`.
 
 ### Registering instances
@@ -135,8 +137,13 @@ instance-specific configuration; everything album-related happens in the Immich 
 
 That's the whole linking flow — no album UUIDs, no server-side config. It generalizes:
 **any number of albums on any number of instances** carrying the same group id form an
-n-way sync group. You can also just type a name yourself (`[sync family]` on both) —
+n-way sync group (pairs sharing an album are automatically serialized, never synced
+concurrently). You can also just type a name yourself (`[sync family]` on both) —
 hand-picked names and generated ids are the same mechanism.
+
+Note on same-instance groups (two albums on one server): Immich deduplicates content
+per *user*, so mirrored photos become copies owned by the sync user — it works, but
+budgets the sync user's quota accordingly.
 
 Options inside the annotation (defaults: `deletes=on`, `direction=both`):
 
@@ -223,7 +230,9 @@ sbt assembly                                    # build a runnable fat jar
 ```
 
 Without `IMMICH_SYNC_INTERVAL` the tool runs one reconciliation and exits (cron-style);
-with it (e.g. `15m`) it loops as a long-running service. The config file is read once
+with it (e.g. `15m`) it loops as a long-running service. Run exactly one instance of
+the tool per database (single writer); within a run, cycles never overlap and pairs
+sharing an album are serialized. The config file is read once
 at startup, so changes to `sync.yaml` (new peers, `enabled: false`, thresholds) take
 effect on the next restart. Environment variables are documented in
 `doc/sync.local.env.example`. Migrations run automatically (Flyway, bundled in the jar).
