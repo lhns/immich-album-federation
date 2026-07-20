@@ -27,14 +27,65 @@ Targets Immich **v3.x**. Runs on JDK 21+ (Scala 3, direct style with
        apiKeyEnv: IMMICH_TARGET_API_KEY
    ```
 
-3. Copy `doc/docker-compose.yml` next to it, fill in the API keys and allowed
-   hostnames, and `docker compose up -d`.
+3. Put this `docker-compose.yml` next to it (also in `doc/docker-compose.yml`), fill
+   in the API keys and allowed hostnames, and `docker compose up -d`:
+
+   ```yaml
+   services:
+     db:
+       image: postgres:17-alpine
+       environment:
+         POSTGRES_DB: immich_sync
+         POSTGRES_USER: immich_sync
+         POSTGRES_PASSWORD: immich_sync
+       volumes:
+         - db-data:/var/lib/postgresql/data
+       healthcheck:
+         test: ["CMD-SHELL", "pg_isready -U immich_sync"]
+         interval: 5s
+         timeout: 5s
+         retries: 10
+       restart: unless-stopped
+
+     sync:
+       image: ghcr.io/lhns/immich-album-federation:latest
+       depends_on:
+         db:
+           condition: service_healthy
+       environment:
+         IMMICH_SYNC_DB_URL: jdbc:postgresql://db:5432/immich_sync
+         IMMICH_SYNC_DB_USER: immich_sync
+         IMMICH_SYNC_DB_PASSWORD: immich_sync
+         IMMICH_SYNC_CONFIG: /config/sync.yaml
+         # Reconcile continuously on this interval (30s / 15m / 1h).
+         IMMICH_SYNC_INTERVAL: 15m
+         # Preview mode: logs what would happen without writing anything.
+         # Set to "false" once the plan looks right.
+         DRY_RUN: "true"
+         # Re-arm after a circuit-breaker quarantine: paste the one-shot rearm key
+         # from the logs; it is consumed on use, so leaving it set is harmless.
+         #IMMICH_SYNC_REARM: <rearm-key-from-logs>
+         # Public peer hostnames must be allowlisted (private/LAN addresses are
+         # allowed automatically).
+         IMMICH_SYNC_ALLOWED_HOSTS: immich.example.org,immich.example.net
+         # One key per peer named in sync.yaml, each belonging to that instance's
+         # dedicated sync user.
+         IMMICH_SOURCE_API_KEY: replace_me
+         IMMICH_TARGET_API_KEY: replace_me
+       volumes:
+         - ./sync.yaml:/config/sync.yaml:ro
+       restart: unless-stopped
+
+   volumes:
+     db-data:
+   ```
+
 4. Share an album with the sync user on each instance, wait a cycle, and copy the
    generated `[sync <id>]` token from one album's description into the other's.
 
 The compose file starts in **`DRY_RUN: "true"`** — the logs show exactly what would
 happen without writing anything. When the plan looks right, set it to `"false"` and the
-service reconciles continuously (`IMMICH_SYNC_INTERVAL`, default in the example: 15m).
+service reconciles continuously.
 
 ## The model: sync users
 
