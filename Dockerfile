@@ -13,8 +13,9 @@ COPY src/ src/
 RUN sbt -batch assembly
 
 FROM eclipse-temurin:21-jre
-RUN useradd --system --create-home --home-dir /app sync
-USER sync
+# "sync" is taken: it is a stock Unix system account in the base image.
+RUN useradd --system --create-home --home-dir /app immichsync
+USER immichsync
 WORKDIR /app
 COPY --from=build /build/target/scala-3.7.3/app.jar /app/app.jar
 
