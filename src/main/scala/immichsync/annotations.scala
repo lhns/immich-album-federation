@@ -321,7 +321,8 @@ def runAnnotationDiscovery(
 
     plan.autoAnnotations.foreach { annotation =>
       effectiveApi.updateAlbumDescription(Album(serverByPeerId(annotation.peerId), annotation.albumId), annotation.newDescription)
-      if (applyWrites) println(s"[discover] stamped album ${annotation.albumId} with [sync ${annotation.token}]")
+      val verb = if (applyWrites) "stamped" else "would stamp"
+      println(s"[discover] $verb album ${annotation.albumId} with [sync ${annotation.token}]")
     }
 
     val existing = connect(db.xa)(loadAllPairs())
