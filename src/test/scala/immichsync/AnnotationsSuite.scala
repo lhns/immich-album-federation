@@ -1,8 +1,8 @@
 package immichsync
 
 class AnnotationsSuite extends munit.FunSuite:
-  private val peerOne = SyncPeer(1L, "one", "http://one.local", "ONE_KEY", enabled = true)
-  private val peerTwo = SyncPeer(2L, "two", "http://two.local", "TWO_KEY", enabled = true)
+  private val peerOne = SyncPeer(1L, "one", "http://one.local", enabled = true)
+  private val peerTwo = SyncPeer(2L, "two", "http://two.local", enabled = true)
   private val peers = Seq(peerOne, peerTwo)
 
   private def album(id: String, name: String, description: String): AlbumSummary =

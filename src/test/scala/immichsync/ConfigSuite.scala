@@ -8,10 +8,10 @@ class ConfigSuite extends munit.FunSuite:
     s"""peers:
        |  - name: source
        |    baseUrl: http://192.168.1.10:2283
-       |    apiKeyEnv: IMMICH_SOURCE_API_KEY
+       |    apiKey: source-key
        |  - name: target
        |    baseUrl: https://immich.example.org
-       |    apiKeyEnv: IMMICH_TARGET_API_KEY
+       |    apiKey: target-key
        |pairs:
        |  - name: family
        |    left: { peer: source, album: $uuidA }
@@ -23,7 +23,7 @@ class ConfigSuite extends munit.FunSuite:
   test("config: parses peers and pairs") {
     val config = parseSyncConfig(validYaml).fold(e => fail(e), identity)
     assertEquals(config.peers.map(_.name), List("source", "target"))
-    assertEquals(config.peers.head.apiKeyEnv, "IMMICH_SOURCE_API_KEY")
+    assertEquals(config.peers.head.apiKey, "source-key")
     val pair = config.allPairs.head
     assertEquals(pair.name, "family")
     assertEquals(pair.left, PairEndpointConfig("source", uuidA))
@@ -37,7 +37,7 @@ class ConfigSuite extends munit.FunSuite:
       """peers:
         |  - name: source
         |    baseUrl: http://192.168.1.10:2283
-        |    apiKeyEnv: IMMICH_SOURCE_API_KEY
+        |    apiKey: source-key
         |""".stripMargin
     ).fold(e => fail(e), identity)
     assert(config.allPairs.isEmpty)

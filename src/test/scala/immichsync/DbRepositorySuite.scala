@@ -11,14 +11,8 @@ import java.util.concurrent.atomic.AtomicLong
 class DbRepositorySuite extends munit.FunSuite:
   private val dbCounter = AtomicLong(0)
 
-  private val leftPeerCfg = PeerConfig("left", "http://left.local", "LEFT_KEY")
-  private val rightPeerCfg = PeerConfig("right", "http://right.local", "RIGHT_KEY")
-
-  private val safety = SafetyConfig(
-    allowedHosts = Set("left.local", "right.local"),
-    blockedHosts = Set.empty,
-    allowPrivateNetworks = false,
-  )
+  private val leftPeerCfg = PeerConfig("left", "http://left.local", "left-key")
+  private val rightPeerCfg = PeerConfig("right", "http://right.local", "right-key")
 
   private def withDb[A](f: DbRuntime => A): A =
     val name = s"synctest${dbCounter.incrementAndGet()}"
@@ -62,7 +56,6 @@ class DbRepositorySuite extends munit.FunSuite:
       pair = pair,
       leftPeer = leftPeer,
       rightPeer = rightPeer,
-      safety = safety,
       applyWrites = true,
       repo = DbSyncRepository(db),
       api = api,
@@ -216,13 +209,13 @@ class DbRepositorySuite extends munit.FunSuite:
       api.setAlbumList(rightPeer.baseUrl, Seq(AlbumSummary("album-b", "B", "")))
 
       // Run 1: both albums get stamped with fresh unique tokens; no pairs yet.
-      runAnnotationDiscovery(db, api, safety, _ => "k", applyWrites = true)
+      runAnnotationDiscovery(db, api, _ => "k", applyWrites = true)
       assertEquals(api.descriptionUpdates.size, 2)
       assertEquals(connect(db.xa)(loadAllPairs()).size, 0)
       assertEquals(connect(db.xa)(countSyncAlbums()), 2L)
 
       // Run 2: albums are now annotated with singleton tokens; still no pairs, no re-stamps.
-      runAnnotationDiscovery(db, api, safety, _ => "k", applyWrites = true)
+      runAnnotationDiscovery(db, api, _ => "k", applyWrites = true)
       assertEquals(api.descriptionUpdates.size, 2)
       assertEquals(connect(db.xa)(loadAllPairs()).size, 0)
       assertEquals(connect(db.xa)(countSyncGroups()), 2L)
@@ -230,27 +223,27 @@ class DbRepositorySuite extends munit.FunSuite:
       // Run 3: the user overrides B's token to match A's -> one pair, one shared group.
       val tokenA = parseSyncAnnotations(api.listAlbums(ImmichServer(leftPeer.baseUrl, "k")).head.description).annotations.head.group
       api.setAlbumList(rightPeer.baseUrl, Seq(AlbumSummary("album-b", "B", s"[sync $tokenA]")))
-      runAnnotationDiscovery(db, api, safety, _ => "k", applyWrites = true)
+      runAnnotationDiscovery(db, api, _ => "k", applyWrites = true)
       val pairs3 = connect(db.xa)(loadAllPairs())
       assertEquals(pairs3.size, 1)
       assert(pairs3.head.enabled)
       assert(pairs3.head.propagateDeletes) // deletes=on is the default
 
       // Run 4: idempotent — same single row, membership stable.
-      runAnnotationDiscovery(db, api, safety, _ => "k", applyWrites = true)
+      runAnnotationDiscovery(db, api, _ => "k", applyWrites = true)
       assertEquals(connect(db.xa)(loadAllPairs()).size, 1)
       assertEquals(connect(db.xa)(countSyncAlbums()), 2L)
 
       // Run 5: B regroups -> the pair is disabled, never deleted or duplicated.
       api.setAlbumList(rightPeer.baseUrl, Seq(AlbumSummary("album-b", "B", "[sync elsewhere-group]")))
-      runAnnotationDiscovery(db, api, safety, _ => "k", applyWrites = true)
+      runAnnotationDiscovery(db, api, _ => "k", applyWrites = true)
       val pairs5 = connect(db.xa)(loadAllPairs())
       assertEquals(pairs5.size, 1)
       assert(!pairs5.head.enabled)
 
       // Run 6: back to the shared token -> the same row is re-enabled additively.
       api.setAlbumList(rightPeer.baseUrl, Seq(AlbumSummary("album-b", "B", s"[sync $tokenA]")))
-      runAnnotationDiscovery(db, api, safety, _ => "k", applyWrites = true)
+      runAnnotationDiscovery(db, api, _ => "k", applyWrites = true)
       val pairs6 = connect(db.xa)(loadAllPairs())
       assertEquals(pairs6.size, 1)
       assert(pairs6.head.enabled)
@@ -360,7 +353,7 @@ class DbRepositorySuite extends munit.FunSuite:
       api.setAlbumList(leftPeer.baseUrl, Seq(AlbumSummary("album-a", "A", "")))
       api.setAlbumList(rightPeer.baseUrl, Seq(AlbumSummary("album-b", "B", "[sync grp-x]")))
 
-      runAnnotationDiscovery(db, api, safety, _ => "k", applyWrites = false)
+      runAnnotationDiscovery(db, api, _ => "k", applyWrites = false)
 
       assert(api.descriptionUpdates.isEmpty)
       assertEquals(connect(db.xa)(loadAllPairs()).size, 0)
@@ -384,7 +377,7 @@ class DbRepositorySuite extends munit.FunSuite:
 
       (1 to 4).foreach { _ =>
         executePairSyncWith(
-          pair = pair, leftPeer = leftPeer, rightPeer = rightPeer, safety = safety,
+          pair = pair, leftPeer = leftPeer, rightPeer = rightPeer,
           applyWrites = false, repo = DbSyncRepository(db), api = api,
           resolveApiKey = _ => "dummy-key", retention = retention,
         )

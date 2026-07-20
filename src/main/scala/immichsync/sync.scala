@@ -179,7 +179,7 @@ def executePairSync(
     pair: AlbumPair,
     leftPeer: SyncPeer,
     rightPeer: SyncPeer,
-    safety: SafetyConfig,
+    resolveApiKey: SyncPeer => String,
     applyWrites: Boolean,
     thresholds: Thresholds,
     transferConcurrency: Int,
@@ -189,11 +189,10 @@ def executePairSync(
     pair = pair,
     leftPeer = leftPeer,
     rightPeer = rightPeer,
-    safety = safety,
     applyWrites = applyWrites,
     repo = DbSyncRepository(db),
     api = api,
-    resolveApiKey = requiredEnv,
+    resolveApiKey = resolveApiKey,
     thresholds = thresholds,
     transferConcurrency = transferConcurrency,
     retention = retention,
@@ -203,18 +202,14 @@ def executePairSyncWith(
     pair: AlbumPair,
     leftPeer: SyncPeer,
     rightPeer: SyncPeer,
-    safety: SafetyConfig,
     applyWrites: Boolean,
     repo: SyncRepository,
     api: ImmichApi,
-    resolveApiKey: String => String = requiredEnv,
+    resolveApiKey: SyncPeer => String,
     thresholds: Thresholds = Thresholds.Default,
     transferConcurrency: Int = 3,
     retention: RetentionConfig = RetentionConfig.Default,
 ): Unit =
-  assertSafeHost(leftPeer.baseUrl, safety)
-  assertSafeHost(rightPeer.baseUrl, safety)
-
   // Structural dry-run guarantee: without applyWrites, neither Immich nor the sync
   // state can be mutated below, regardless of any further flag handling.
   val (effectiveApi, effectiveRepo) =
@@ -233,13 +228,13 @@ private def executePairSyncGuarded(
     applyWrites: Boolean,
     repo: SyncRepository,
     api: ImmichApi,
-    resolveApiKey: String => String,
+    resolveApiKey: SyncPeer => String,
     thresholds: Thresholds,
     transferConcurrency: Int,
     retention: RetentionConfig,
 ): Unit =
-  val leftServer = ImmichServer(leftPeer.baseUrl, resolveApiKey(leftPeer.apiKeyEnv))
-  val rightServer = ImmichServer(rightPeer.baseUrl, resolveApiKey(rightPeer.apiKeyEnv))
+  val leftServer = ImmichServer(leftPeer.baseUrl, resolveApiKey(leftPeer))
+  val rightServer = ImmichServer(rightPeer.baseUrl, resolveApiKey(rightPeer))
   val leftAlbum = Album(leftServer, pair.leftAlbumId)
   val rightAlbum = Album(rightServer, pair.rightAlbumId)
 

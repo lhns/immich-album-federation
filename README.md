@@ -15,20 +15,21 @@ Targets Immich **v3.x**. Runs on JDK 21+ (Scala 3, direct style with
 
 1. On each instance, create a sync user and API key (two minutes — see
    [Setting up a sync user](#setting-up-a-sync-user-once-per-instance)).
-2. Create a `sync.yaml` naming your instances (see `doc/sync.example.yaml`):
+2. Create a `sync.yaml` with your instances and their sync users' API keys (see
+   `doc/sync.example.yaml`; more instances are just more list entries):
 
    ```yaml
    peers:
-     - name: source
+     - name: alpha
        baseUrl: https://immich.example.org
-       apiKeyEnv: IMMICH_SOURCE_API_KEY
-     - name: target
+       apiKey: <alpha sync user's api key>
+     - name: beta
        baseUrl: https://immich.example.net
-       apiKeyEnv: IMMICH_TARGET_API_KEY
+       apiKey: <beta sync user's api key>
    ```
 
-3. Put this `docker-compose.yml` next to it (also in `doc/docker-compose.yml`), fill
-   in the API keys and allowed hostnames, and `docker compose up -d`:
+3. Put this `docker-compose.yml` next to it (also in `doc/docker-compose.yml`) and
+   `docker compose up -d` — everything instance-specific lives in `sync.yaml`:
 
    ```yaml
    services:
@@ -65,13 +66,6 @@ Targets Immich **v3.x**. Runs on JDK 21+ (Scala 3, direct style with
          # Re-arm after a circuit-breaker quarantine: paste the one-shot rearm key
          # from the logs; it is consumed on use, so leaving it set is harmless.
          #IMMICH_SYNC_REARM: <rearm-key-from-logs>
-         # Public peer hostnames must be allowlisted (private/LAN addresses are
-         # allowed automatically).
-         IMMICH_SYNC_ALLOWED_HOSTS: immich.example.org,immich.example.net
-         # One key per peer named in sync.yaml, each belonging to that instance's
-         # dedicated sync user.
-         IMMICH_SOURCE_API_KEY: replace_me
-         IMMICH_TARGET_API_KEY: replace_me
        volumes:
          - ./sync.yaml:/config/sync.yaml:ro
        restart: unless-stopped
@@ -107,27 +101,28 @@ opt-in and the security boundary:
 2. Log in as that user → Account Settings → API Keys → create a key with permissions:
    `album.read`, `album.update`, `albumAsset.create`, `albumAsset.delete`,
    `asset.read`, `asset.upload`, `asset.download`, `asset.delete`, `asset.update`.
-3. Put the key into the environment variable your config names for that peer.
+3. Put the key into that peer's `apiKey` in `sync.yaml`.
 
 ### Registering instances
 
-Peers are declared in a YAML file (see `doc/sync.example.yaml`), loaded via
+Peers are declared in one YAML file (see `doc/sync.example.yaml`), loaded via
 `--config=path` or `IMMICH_SYNC_CONFIG`:
 
 ```yaml
 peers:
-  - name: source
+  - name: alpha
     baseUrl: http://192.168.1.10:2283
-    apiKeyEnv: IMMICH_SOURCE_API_KEY
-  - name: target
+    apiKey: <alpha sync user's api key>
+  - name: beta
     baseUrl: https://immich.example.org
-    apiKeyEnv: IMMICH_TARGET_API_KEY
+    apiKey: <beta sync user's api key>
 ```
 
 Peers get stable database ids keyed by `name` — changing a `baseUrl` later is safe and
-never orphans sync state. API keys stay in environment variables, never in the file.
-Base URLs are the one thing that must be configured; everything album-related happens
-in the Immich UI.
+never orphans sync state. API keys live only in this file and in process memory; they
+are never written to the database. The file is therefore the one secret to protect:
+keep it out of version control and mount it read-only. This file is the only
+instance-specific configuration; everything album-related happens in the Immich UI.
 
 ## Linking albums: `[sync <group>]`
 
@@ -212,7 +207,6 @@ warning, and the photo is protected from being copied back to the side that dele
 - With `deletes=off`, removals are *suppressed*, not mirrored: the photo stays on the
   other side but is not copied back either (a tombstone remembers the removal until the
   photo is deliberately re-added).
-- Host allowlist/blocklist plus a private-network guard on every peer URL.
 
 ## Running without docker
 

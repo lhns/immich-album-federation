@@ -1,6 +1,7 @@
 # Quick-start deployment. Put this next to a sync.yaml (see sync.example.yaml),
-# fill in the API keys, then:  docker compose up -d
+# then:  docker compose up -d
 # Starts in DRY_RUN mode: check the logs, then set DRY_RUN to "false".
+# All instance-specific settings (peers, API keys, thresholds) live in sync.yaml.
 services:
   db:
     image: postgres:17-alpine
@@ -36,13 +37,6 @@ services:
       # the logs (comma-separate several) and run `docker compose up -d`. The key is
       # consumed on use, so leaving this set is harmless.
       #IMMICH_SYNC_REARM: <rearm-key-from-logs>
-      # Public peer hostnames must be allowlisted (private/LAN addresses are
-      # allowed automatically).
-      IMMICH_SYNC_ALLOWED_HOSTS: immich.example.org,immich.example.net
-      # One key per peer named in sync.yaml, each belonging to that instance's
-      # dedicated sync user (README: "Setting up a sync user").
-      IMMICH_SOURCE_API_KEY: replace_me
-      IMMICH_TARGET_API_KEY: replace_me
     volumes:
       - ./sync.yaml:/config/sync.yaml:ro
     restart: unless-stopped

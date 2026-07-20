@@ -342,14 +342,8 @@ class SyncSuite extends munit.FunSuite:
     forceAdditive = false,
   )
 
-  private val leftPeer = SyncPeer(10L, "left", "http://left.local", "LEFT_KEY", enabled = true)
-  private val rightPeer = SyncPeer(11L, "right", "http://right.local", "RIGHT_KEY", enabled = true)
-
-  private val safety = SafetyConfig(
-    allowedHosts = Set("left.local", "right.local"),
-    blockedHosts = Set.empty,
-    allowPrivateNetworks = false,
-  )
+  private val leftPeer = SyncPeer(10L, "left", "http://left.local", enabled = true)
+  private val rightPeer = SyncPeer(11L, "right", "http://right.local", enabled = true)
 
   private def mkAsset(
       id: String,
@@ -667,7 +661,6 @@ class SyncSuite extends munit.FunSuite:
       pair = pair,
       leftPeer = leftPeer,
       rightPeer = rightPeer,
-      safety = safety,
       applyWrites = applyWrites,
       repo = repo,
       api = api,

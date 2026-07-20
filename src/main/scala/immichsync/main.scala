@@ -3,7 +3,7 @@ package immichsync
 import com.augustnagro.magnum.*
 import sttp.client4.DefaultSyncBackend
 
-import java.net.{InetAddress, URI}
+import java.net.URI
 import scala.util.control.NonFatal
 
 def requiredEnv(name: String): String =
@@ -41,7 +41,7 @@ def parseCsvSet(raw: String): Set[String] =
     .toSet
 
 def parseArgs(args: Array[String]): CliConfig =
-  args.foldLeft(CliConfig(dryRun = false, pairFilter = None, extraAllowedHosts = Set.empty, rearmPairs = List.empty, discoverOnly = false, configFile = None)) {
+  args.foldLeft(CliConfig(dryRun = false, pairFilter = None, rearmPairs = List.empty, discoverOnly = false, configFile = None)) {
     case (acc, "--dry-run") => acc.copy(dryRun = true)
     case (acc, "--discover") => acc.copy(discoverOnly = true)
     case (acc, arg) if arg.startsWith("--config=") =>
@@ -51,22 +51,9 @@ def parseArgs(args: Array[String]): CliConfig =
     case (acc, arg) if arg.startsWith("--rearm=") =>
       val name = arg.stripPrefix("--rearm=").trim
       if (name.isEmpty) acc else acc.copy(rearmPairs = acc.rearmPairs :+ name)
-    case (acc, arg) if arg.startsWith("--allow-host=") =>
-      val host = arg.stripPrefix("--allow-host=").trim.toLowerCase
-      if (host.isEmpty) acc else acc.copy(extraAllowedHosts = acc.extraAllowedHosts + host)
     case (_, arg) =>
       throw new RuntimeException(s"Unknown argument: $arg")
   }
-
-def loadSafetyConfig(cli: CliConfig): SafetyConfig =
-  val defaultAllowed = Set("localhost", "127.0.0.1", "::1", "host.docker.internal")
-  val fromEnvAllowed = parseCsvSet(envOrDefault("IMMICH_SYNC_ALLOWED_HOSTS", ""))
-  val fromEnvBlocked = parseCsvSet(envOrDefault("IMMICH_SYNC_BLOCKED_HOSTS", ""))
-  SafetyConfig(
-    allowedHosts = defaultAllowed ++ fromEnvAllowed ++ cli.extraAllowedHosts,
-    blockedHosts = fromEnvBlocked,
-    allowPrivateNetworks = parseBoolEnv("IMMICH_SYNC_ALLOW_PRIVATE_NETWORKS", defaultValue = true),
-  )
 
 def loadThresholds(): Thresholds =
   Thresholds(
@@ -98,44 +85,20 @@ def parseIntervalSeconds(raw: String): Option[Long] =
     Some(digits.toLong * factor)
   }
 
-def isPrivateAddress(address: InetAddress): Boolean =
-  val host = address.getHostAddress.toLowerCase
-  address.isAnyLocalAddress ||
-  address.isLoopbackAddress ||
-  address.isSiteLocalAddress ||
-  address.isLinkLocalAddress ||
-  host.startsWith("fc") ||
-  host.startsWith("fd")
-
-def assertSafeHost(baseUrl: String, safety: SafetyConfig): Unit =
-  val host = Option(URI.create(baseUrl).getHost)
-    .map(_.trim.toLowerCase)
-    .getOrElse(throw new RuntimeException(s"Invalid base URL, missing host: $baseUrl"))
-  if (safety.blockedHosts.contains(host)) {
-    throw new RuntimeException(s"Blocked host '$host' is not allowed for sync execution")
-  }
-  if (safety.allowedHosts.contains(host)) {
-    ()
-  } else {
-    val addresses = InetAddress.getAllByName(host).toVector
-    val allPrivate = addresses.nonEmpty && addresses.forall(isPrivateAddress)
-    if (!(safety.allowPrivateNetworks && allPrivate)) {
-      throw new RuntimeException(
-        s"Host '$host' is not in allowlist and does not resolve to private/local addresses"
-      )
-    }
-  }
+// Peer URLs come exclusively from the operator-controlled config (file/env): anyone
+// who can edit those already holds the API keys, so no host allow/deny machinery.
+def validateBaseUrl(baseUrl: String): Unit =
+  if (Option(URI.create(baseUrl).getHost).forall(_.isBlank))
+    throw new RuntimeException(s"Invalid base URL, missing host: $baseUrl")
 
 def checkPeerVersions(
     peers: Seq[SyncPeer],
     api: ImmichApi,
-    safety: SafetyConfig,
-    resolveApiKey: String => String,
+    resolveApiKey: SyncPeer => String,
 ): Unit =
   val versions = peers.flatMap { peer =>
     try {
-      assertSafeHost(peer.baseUrl, safety)
-      val version = api.serverVersion(ImmichServer(peer.baseUrl, resolveApiKey(peer.apiKeyEnv)))
+      val version = api.serverVersion(ImmichServer(peer.baseUrl, resolveApiKey(peer)))
       println(s"[peer=${peer.name}] immich $version")
       Some(peer.name -> version)
     } catch {
@@ -155,7 +118,6 @@ def checkPeerVersions(
 @main
 def main(args: String*): Unit =
   val cli = parseArgs(args.toArray)
-  val safety = loadSafetyConfig(cli)
   val thresholds = loadThresholds()
   val retention = loadRetentionConfig()
   val pairConcurrency = envOrDefault("IMMICH_SYNC_PAIR_CONCURRENCY", "2").toInt
@@ -174,9 +136,21 @@ def main(args: String*): Unit =
     val abandoned = transact(db.xa)(markAbandonedRuns())
     if (abandoned > 0) println(s"[startup] marked $abandoned abandoned run(s) from a previous process as aborted")
 
-    cli.configFile.orElse(sys.env.get("IMMICH_SYNC_CONFIG").filter(_.nonEmpty)).foreach { path =>
-      applySyncConfig(db, loadSyncConfigFile(path))
+    // The config file is the only source of peers and their API keys. Keys stay in
+    // memory for this process; the database never sees them.
+    val syncConfig = cli.configFile.orElse(sys.env.get("IMMICH_SYNC_CONFIG").filter(_.nonEmpty)).map { path =>
+      val config = loadSyncConfigFile(path)
+      config.peers.foreach(p => validateBaseUrl(p.baseUrl))
+      applySyncConfig(db, config)
+      config
     }
+    val apiKeyByPeerName: Map[String, String] =
+      syncConfig.map(_.peers.map(p => p.name.toLowerCase -> p.apiKey).toMap).getOrElse(Map.empty)
+    def resolveApiKey(peer: SyncPeer): String =
+      apiKeyByPeerName.getOrElse(
+        peer.name.toLowerCase,
+        throw new RuntimeException(s"No API key for peer '${peer.name}': add the peer to the config file (--config / IMMICH_SYNC_CONFIG)"),
+      )
 
     // Docker-friendly re-arm: when the circuit breaker quarantines a pair, it logs a
     // one-shot rearm key. Pasting that key into IMMICH_SYNC_REARM re-arms exactly that
@@ -202,7 +176,7 @@ def main(args: String*): Unit =
     }
 
     def syncCycle(): Unit =
-      runAnnotationDiscovery(db, api, safety, requiredEnv, applyWrites = applyWrites)
+      runAnnotationDiscovery(db, api, resolveApiKey, applyWrites = applyWrites)
 
       val (peers, pairs) = connect(db.xa):
         (loadEnabledPeers(), loadEnabledPairs(cli.pairFilter))
@@ -212,7 +186,7 @@ def main(args: String*): Unit =
       } else if (pairs.isEmpty) {
         println("No enabled album pairs found. Share albums with the sync users and give them matching [sync <group>] annotations.")
       } else {
-        checkPeerVersions(peers, api, safety, requiredEnv)
+        checkPeerVersions(peers, api, resolveApiKey)
 
         val peerById = peers.map(peer => peer.id -> peer).toMap
         // Pairs whose peer is disabled (enabled: false in the config = server-level
@@ -230,7 +204,7 @@ def main(args: String*): Unit =
               pair = pair,
               leftPeer = leftPeer,
               rightPeer = rightPeer,
-              safety = safety,
+              resolveApiKey = resolveApiKey,
               applyWrites = applyWrites,
               thresholds = thresholds,
               transferConcurrency = transferConcurrency,

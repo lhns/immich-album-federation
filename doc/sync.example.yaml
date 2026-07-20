@@ -1,27 +1,34 @@
-# Declarative topology config, loaded via --config=path or IMMICH_SYNC_CONFIG.
+# The config file: the single place instances are defined, loaded via
+# --config=path or IMMICH_SYNC_CONFIG.
+# Peers are equal participants (there is no source/target); list as many as you
+# like, and any albums sharing a [sync <group>] token sync n-way across them.
 # Peers are keyed by name: changing a baseUrl updates the existing peer row and
 # keeps its stable id, so hostname changes never orphan sync state.
-# API keys are NOT stored here; each peer names the env var holding the key of
-# that instance's DEDICATED SYNC USER (see README, "Setting up a sync user").
+# Each apiKey belongs to that instance's DEDICATED SYNC USER (see README).
+# This file contains secrets: keep it out of version control (gitignored here)
+# and mount it read-only.
 peers:
-  - name: source
+  - name: alpha
     baseUrl: http://192.168.1.10:2283
-    apiKeyEnv: IMMICH_SOURCE_API_KEY
+    apiKey: replace_me
     # enabled: false           # server-level pause: skips all this peer's pairs
     # maxRemovalCount: 25      # per-server circuit-breaker overrides
     # maxRemovalFraction: 0.3
-  - name: target
+  - name: beta
     baseUrl: https://immich.example.org
-    apiKeyEnv: IMMICH_TARGET_API_KEY
+    apiKey: replace_me
+  # - name: gamma              # a third instance is just another list entry
+  #   baseUrl: https://immich.example.net
+  #   apiKey: replace_me
 
 # Optional. The primary way to link albums is the [sync <group>] annotation:
 # share each album with its instance's sync user, let the tool stamp it with a
-# generated group id, and copy one id to the partner album. Manual pairs declared
-# here are for cases where you don't want to touch descriptions.
+# generated group id, and copy one id to the partner album(s). Manual pairs
+# declared here are for cases where you don't want to touch descriptions.
 pairs:
   - name: family
-    left: { peer: source, album: aaaaaaaa-1111-2222-3333-444444444444 }
-    right: { peer: target, album: bbbbbbbb-1111-2222-3333-444444444444 }
+    left: { peer: alpha, album: aaaaaaaa-1111-2222-3333-444444444444 }
+    right: { peer: beta, album: bbbbbbbb-1111-2222-3333-444444444444 }
     mode: bidirectional        # bidirectional | left_to_right | right_to_left
     deletes: true              # propagate album-membership removals (default true)
     trashOrphans: true         # trash tool-uploaded assets orphaned by a removal

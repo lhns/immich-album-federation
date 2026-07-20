@@ -7,7 +7,6 @@ CREATE TABLE IF NOT EXISTS sync_peer (
   id BIGSERIAL PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
   base_url TEXT NOT NULL,
-  api_key_env TEXT NOT NULL,
   enabled BOOLEAN NOT NULL DEFAULT TRUE,
   max_removal_count INTEGER,
   max_removal_fraction DOUBLE PRECISION,

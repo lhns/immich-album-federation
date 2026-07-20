@@ -1,26 +1,27 @@
 package immichsync
 
-// Declarative configuration file (YAML) for peers and optional manual pairs.
+// Declarative configuration file (YAML): the single place peers are defined.
 //
 // The database stays the source of truth for runtime state (runs, baselines,
 // tombstones, deletion history); the config file declares the topology and is
 // upserted into sync_peer / album_pair at startup. Peers are keyed by name, so
-// a changed base_url updates the existing peer row and its stable id — hostname
-// changes never orphan sync state. API keys are never stored in the file; each
-// peer names the environment variable that holds its DEDICATED SYNC USER's key.
+// a changed baseUrl updates the existing peer row and its stable id — hostname
+// changes never orphan sync state. Each peer carries the API key of its DEDICATED
+// SYNC USER; keys are held in memory only and never persisted to the database,
+// which makes the config file the one secret to protect.
 //
 //   peers:
-//     - name: source
+//     - name: alpha
 //       baseUrl: http://192.168.1.10:2283
-//       apiKeyEnv: IMMICH_SOURCE_API_KEY
-//     - name: target
+//       apiKey: <sync user's api key>
+//     - name: beta
 //       baseUrl: https://immich.example.org
-//       apiKeyEnv: IMMICH_TARGET_API_KEY
+//       apiKey: <sync user's api key>
 //
 //   pairs:                       # optional; [sync <group>] annotations are the primary UX
 //     - name: family
-//       left: { peer: source, album: aaaaaaaa-1111-2222-3333-444444444444 }
-//       right: { peer: target, album: bbbbbbbb-1111-2222-3333-444444444444 }
+//       left: { peer: alpha, album: aaaaaaaa-1111-2222-3333-444444444444 }
+//       right: { peer: beta, album: bbbbbbbb-1111-2222-3333-444444444444 }
 //       mode: bidirectional      # bidirectional | left_to_right | right_to_left
 //       deletes: true            # default true
 
@@ -32,7 +33,7 @@ import java.nio.file.{Files, Path}
 case class PeerConfig(
   name: String,
   baseUrl: String,
-  apiKeyEnv: String,
+  apiKey: String,
   enabled: Option[Boolean] = None,
   maxRemovalCount: Option[Int] = None,
   maxRemovalFraction: Option[Double] = None,
@@ -67,8 +68,8 @@ def validateSyncConfig(config: SyncConfig): Seq[String] =
 
   val duplicatePeerNames = config.peers.groupBy(_.name.toLowerCase).filter(_._2.size > 1).keys
   duplicatePeerNames.foreach(n => errors += s"duplicate peer name '$n'")
-  config.peers.filter(p => p.name.isEmpty || p.baseUrl.isEmpty || p.apiKeyEnv.isEmpty)
-    .foreach(p => errors += s"peer '${p.name}' has empty name, baseUrl or apiKeyEnv")
+  config.peers.filter(p => p.name.isEmpty || p.baseUrl.isEmpty || p.apiKey.isEmpty)
+    .foreach(p => errors += s"peer '${p.name}' has empty name, baseUrl or apiKey")
 
   config.peers.foreach { peer =>
     peer.maxRemovalFraction.foreach { f =>
@@ -123,6 +124,7 @@ def loadSyncConfigFile(path: String): SyncConfig =
 // DO NOTHING, and the tool is single-writer so the pattern is race-free in practice.
 // Name matching is case-insensitive (consistent with peersByName lookups): changing
 // the case in the config updates the same row instead of forking a second peer.
+// The API key is deliberately NOT persisted: it stays in the config file only.
 def upsertPeer(peer: PeerConfig)(using DbTx): Unit =
   val enabled = peer.enabled.getOrElse(true)
   val updated =
@@ -130,7 +132,6 @@ def upsertPeer(peer: PeerConfig)(using DbTx): Unit =
         UPDATE sync_peer
         SET name = ${peer.name},
             base_url = ${peer.baseUrl},
-            api_key_env = ${peer.apiKeyEnv},
             enabled = $enabled,
             max_removal_count = ${peer.maxRemovalCount},
             max_removal_fraction = ${peer.maxRemovalFraction}
@@ -138,8 +139,8 @@ def upsertPeer(peer: PeerConfig)(using DbTx): Unit =
       """.update.run()
   if (updated == 0) {
     sql"""
-        INSERT INTO sync_peer(name, base_url, api_key_env, enabled, max_removal_count, max_removal_fraction)
-        VALUES (${peer.name}, ${peer.baseUrl}, ${peer.apiKeyEnv}, $enabled, ${peer.maxRemovalCount}, ${peer.maxRemovalFraction})
+        INSERT INTO sync_peer(name, base_url, enabled, max_removal_count, max_removal_fraction)
+        VALUES (${peer.name}, ${peer.baseUrl}, $enabled, ${peer.maxRemovalCount}, ${peer.maxRemovalFraction})
       """.update.run()
   }
 

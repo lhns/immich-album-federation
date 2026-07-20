@@ -12,11 +12,12 @@ case class Album(server: ImmichServer, id: String)
 
 case class AlbumSummary(id: String, albumName: String, description: String)
 
+// API keys are not part of the peer row: they live only in the config file and are
+// resolved in memory per run (never persisted to the database).
 case class SyncPeer(
   id: Long,
   name: String,
   baseUrl: String,
-  apiKeyEnv: String,
   enabled: Boolean,
   maxRemovalCount: Option[Int] = None,
   maxRemovalFraction: Option[Double] = None,
@@ -42,16 +43,9 @@ case class AlbumPair(
 case class CliConfig(
   dryRun: Boolean,
   pairFilter: Option[String],
-  extraAllowedHosts: Set[String],
   rearmPairs: List[String],
   discoverOnly: Boolean,
   configFile: Option[String],
-)
-
-case class SafetyConfig(
-  allowedHosts: Set[String],
-  blockedHosts: Set[String],
-  allowPrivateNetworks: Boolean,
 )
 
 case class Thresholds(maxRemovalCount: Int, maxRemovalFraction: Double)

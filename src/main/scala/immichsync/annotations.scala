@@ -301,19 +301,17 @@ def autoPairName(peerNameById: Map[Long, String], link: DiscoveredLink): String 
 def runAnnotationDiscovery(
     db: DbRuntime,
     api: ImmichApi,
-    safety: SafetyConfig,
-    resolveApiKey: String => String,
+    resolveApiKey: SyncPeer => String,
     applyWrites: Boolean,
 ): Unit =
   val peers = connect(db.xa)(loadEnabledPeers())
   if (peers.isEmpty) {
     println("[discover] no enabled peers, skipping annotation discovery")
   } else {
-    peers.foreach(p => assertSafeHost(p.baseUrl, safety))
     // Structural dry-run guarantee for the Immich side: stamping goes through the
     // read-only facade when not applying.
     val effectiveApi = if (applyWrites) api else DryRunImmichApi(api)
-    val serverByPeerId = peers.map(p => p.id -> ImmichServer(p.baseUrl, resolveApiKey(p.apiKeyEnv))).toMap
+    val serverByPeerId = peers.map(p => p.id -> ImmichServer(p.baseUrl, resolveApiKey(p))).toMap
     // A failed album listing aborts discovery for ALL peers: an unreachable peer must
     // not look like "no annotations" and disable its pairs.
     val albumsByPeer = peers.map(peer => peer.id -> effectiveApi.listAlbums(serverByPeerId(peer.id))).toMap
