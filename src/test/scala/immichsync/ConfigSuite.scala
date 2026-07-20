@@ -68,3 +68,16 @@ class ConfigSuite extends munit.FunSuite:
   test("config: malformed yaml is a Left") {
     assert(parseSyncConfig("peers: [ {{{").isLeft)
   }
+
+  test("interval: units, plain seconds, whitespace and empty") {
+    assertEquals(parseIntervalSeconds("30s"), Some(30L))
+    assertEquals(parseIntervalSeconds("15m"), Some(900L))
+    assertEquals(parseIntervalSeconds("1h"), Some(3600L))
+    assertEquals(parseIntervalSeconds("300"), Some(300L))
+    assertEquals(parseIntervalSeconds("15 m"), Some(900L))
+    assertEquals(parseIntervalSeconds(" 15M "), Some(900L))
+    assertEquals(parseIntervalSeconds(""), None)
+    assertEquals(parseIntervalSeconds("  "), None)
+    intercept[RuntimeException](parseIntervalSeconds("15x"))
+    intercept[RuntimeException](parseIntervalSeconds("m"))
+  }

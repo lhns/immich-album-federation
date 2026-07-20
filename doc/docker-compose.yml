@@ -1,0 +1,47 @@
+# Quick-start deployment. Put this next to a sync.yaml (see sync.example.yaml),
+# fill in the API keys, then:  docker compose up -d
+# Starts in DRY_RUN mode: check the logs, then set DRY_RUN to "false".
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: immich_sync
+      POSTGRES_USER: immich_sync
+      POSTGRES_PASSWORD: immich_sync
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U immich_sync"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  sync:
+    image: ghcr.io/lhns/immich-album-federation:latest
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      IMMICH_SYNC_DB_URL: jdbc:postgresql://db:5432/immich_sync
+      IMMICH_SYNC_DB_USER: immich_sync
+      IMMICH_SYNC_DB_PASSWORD: immich_sync
+      IMMICH_SYNC_CONFIG: /config/sync.yaml
+      # Reconcile continuously on this interval (30s / 15m / 1h).
+      IMMICH_SYNC_INTERVAL: 15m
+      # Preview mode: logs what would happen without writing anything.
+      # Set to "false" once the plan looks right.
+      DRY_RUN: "true"
+      # Public peer hostnames must be allowlisted (private/LAN addresses are
+      # allowed automatically).
+      IMMICH_SYNC_ALLOWED_HOSTS: immich.example.org,immich.example.net
+      # One key per peer named in sync.yaml, each belonging to that instance's
+      # dedicated sync user (README: "Setting up a sync user").
+      IMMICH_SOURCE_API_KEY: replace_me
+      IMMICH_TARGET_API_KEY: replace_me
+    volumes:
+      - ./sync.yaml:/config/sync.yaml:ro
+    restart: unless-stopped
+
+volumes:
+  db-data:

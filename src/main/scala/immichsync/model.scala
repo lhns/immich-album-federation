@@ -38,7 +38,7 @@ case class AlbumPair(
 )
 
 case class CliConfig(
-  applyWrites: Boolean,
+  dryRun: Boolean,
   pairFilter: Option[String],
   extraAllowedHosts: Set[String],
   rearmPair: Option[String],

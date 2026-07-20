@@ -11,6 +11,31 @@ so the same photo uploaded independently on both sides never conflicts.
 Targets Immich **v3.x**. Runs on JDK 21+ (Scala 3, direct style with
 [Ox](https://github.com/softwaremill/ox), sttp-client4, Postgres via magnum/Flyway).
 
+## Quick start (docker compose)
+
+1. On each instance, create a sync user and API key (two minutes — see
+   [Setting up a sync user](#setting-up-a-sync-user-once-per-instance)).
+2. Create a `sync.yaml` naming your instances (see `doc/sync.example.yaml`):
+
+   ```yaml
+   peers:
+     - name: source
+       baseUrl: https://immich.example.org
+       apiKeyEnv: IMMICH_SOURCE_API_KEY
+     - name: target
+       baseUrl: https://immich.example.net
+       apiKeyEnv: IMMICH_TARGET_API_KEY
+   ```
+
+3. Copy `doc/docker-compose.yml` next to it, fill in the API keys and allowed
+   hostnames, and `docker compose up -d`.
+4. Share an album with the sync user on each instance, wait a cycle, and copy the
+   generated `[sync <id>]` token from one album's description into the other's.
+
+The compose file starts in **`DRY_RUN: "true"`** — the logs show exactly what would
+happen without writing anything. When the plan looks right, set it to `"false"` and the
+service reconciles continuously (`IMMICH_SYNC_INTERVAL`, default in the example: 15m).
+
 ## The model: sync users
 
 The tool never uses your personal account. On **each** instance you create a dedicated
@@ -114,7 +139,9 @@ warning, and the photo is protected from being copied back to the side that dele
 
 ### Safety rails
 
-- **Dry-run by default.** Writes need `--apply` *and* `IMMICH_ENABLE_WRITES=YES_I_KNOW`.
+- **Preview mode on demand**: `DRY_RUN=true` (or `--dry-run`) logs every planned action
+  without writing anything — to Immich or to album descriptions. The compose example
+  starts with it enabled.
 - **First run after linking is always an additive union** — an empty album linked to a
   full one gets filled, never the other way around.
 - **API failures can never look like an empty album**: a failed fetch fails the run and
@@ -127,23 +154,24 @@ warning, and the photo is protected from being copied back to the side that dele
   photo is deliberately re-added).
 - Host allowlist/blocklist plus a private-network guard on every peer URL.
 
-## Running
+## Running without docker
 
 Requirements: JDK 21+, [sbt](https://www.scala-sbt.org), Postgres.
 
 ```sh
 sbt test                                        # full suite (in-memory + H2 integration)
-sbt "run --config=./sync.yaml"                  # dry run: plans + audit, no writes
-sbt "run --config=./sync.yaml --apply"          # apply (needs IMMICH_ENABLE_WRITES)
+sbt "run --config=./sync.yaml"                  # one full reconciliation
+sbt "run --config=./sync.yaml --dry-run"        # preview only, writes nothing
 sbt "run --discover"                            # annotation discovery only
 sbt "run --rearm=<pair-name>"                   # clear quarantine, re-baseline additively
-sbt "run --pair=<pair-name> --apply"            # sync a single pair
+sbt "run --pair=<pair-name>"                    # sync a single pair
 sbt assembly                                    # build a runnable fat jar
 ```
 
-Environment variables are documented in `doc/sync.local.env.example`. Run it on a
-schedule (cron/systemd timer); each run is a full reconciliation. Migrations run
-automatically (Flyway, bundled in the jar).
+Without `IMMICH_SYNC_INTERVAL` the tool runs one reconciliation and exits (cron-style);
+with it (e.g. `15m`) it loops as a long-running service. Environment variables are
+documented in `doc/sync.local.env.example`. Migrations run automatically (Flyway,
+bundled in the jar).
 
 ## State, audit, and retention
 

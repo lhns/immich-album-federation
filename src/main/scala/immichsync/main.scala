@@ -30,8 +30,8 @@ def parseCsvSet(raw: String): Set[String] =
     .toSet
 
 def parseArgs(args: Array[String]): CliConfig =
-  args.foldLeft(CliConfig(applyWrites = false, pairFilter = None, extraAllowedHosts = Set.empty, rearmPair = None, discoverOnly = false, configFile = None)) {
-    case (acc, "--apply") => acc.copy(applyWrites = true)
+  args.foldLeft(CliConfig(dryRun = false, pairFilter = None, extraAllowedHosts = Set.empty, rearmPair = None, discoverOnly = false, configFile = None)) {
+    case (acc, "--dry-run") => acc.copy(dryRun = true)
     case (acc, "--discover") => acc.copy(discoverOnly = true)
     case (acc, arg) if arg.startsWith("--config=") =>
       acc.copy(configFile = Some(arg.stripPrefix("--config=").trim).filter(_.nonEmpty))
@@ -67,6 +67,24 @@ def loadRetentionConfig(): RetentionConfig =
     observationKeepRuns = envOrDefault("IMMICH_SYNC_OBSERVATION_KEEP_RUNS", RetentionConfig.Default.observationKeepRuns.toString).toInt,
     auditRetentionDays = envOrDefault("IMMICH_SYNC_AUDIT_RETENTION_DAYS", RetentionConfig.Default.auditRetentionDays.toString).toInt,
   )
+
+// "30s" / "15m" / "1h" (whitespace between number and unit is fine), or a plain
+// number of seconds. Empty/absent = run once and exit.
+def parseIntervalSeconds(raw: String): Option[Long] =
+  val trimmed = raw.trim.toLowerCase
+  if (trimmed.isEmpty) None
+  else {
+    val (digits, unitRaw) = trimmed.span(_.isDigit)
+    val unit = unitRaw.trim
+    val factor = unit match {
+      case "" | "s" => 1L
+      case "m"      => 60L
+      case "h"      => 3600L
+      case other    => throw new RuntimeException(s"Invalid IMMICH_SYNC_INTERVAL '$raw' (use e.g. 30s, 15m, 1h)")
+    }
+    if (digits.isEmpty) throw new RuntimeException(s"Invalid IMMICH_SYNC_INTERVAL '$raw' (use e.g. 30s, 15m, 1h)")
+    Some(digits.toLong * factor)
+  }
 
 def isPrivateAddress(address: InetAddress): Boolean =
   val host = address.getHostAddress.toLowerCase
@@ -130,12 +148,11 @@ def main(args: String*): Unit =
   val retention = loadRetentionConfig()
   val pairConcurrency = envOrDefault("IMMICH_SYNC_PAIR_CONCURRENCY", "2").toInt
   val transferConcurrency = envOrDefault("IMMICH_SYNC_TRANSFER_CONCURRENCY", "3").toInt
-
-  if (cli.applyWrites && envOrDefault("IMMICH_ENABLE_WRITES", "") != "YES_I_KNOW") {
-    throw new RuntimeException(
-      "Writes require explicit confirmation: set IMMICH_ENABLE_WRITES=YES_I_KNOW"
-    )
-  }
+  // The tool applies by default; DRY_RUN=true (or --dry-run) previews without writing.
+  // The safety rails (additive first run, circuit breaker, trash-only, deletion log)
+  // are what make applying safe, not a flag.
+  val applyWrites = !(cli.dryRun || parseBoolEnv("DRY_RUN", defaultValue = false))
+  val intervalSeconds = sys.env.get("IMMICH_SYNC_INTERVAL").flatMap(parseIntervalSeconds)
 
   val backend = DefaultSyncBackend()
   val api = LiveImmichApi(backend)
@@ -146,6 +163,60 @@ def main(args: String*): Unit =
     cli.configFile.orElse(sys.env.get("IMMICH_SYNC_CONFIG").filter(_.nonEmpty)).foreach { path =>
       applySyncConfig(db, loadSyncConfigFile(path))
     }
+
+    def syncCycle(): Unit =
+      runAnnotationDiscovery(db, api, safety, requiredEnv, applyWrites = applyWrites)
+
+      val (peers, pairs) = connect(db.xa):
+        (loadEnabledPeers(), loadEnabledPairs(cli.pairFilter))
+
+      if (cli.discoverOnly) {
+        println(s"Discovery complete. ${pairs.size} enabled pair(s).")
+      } else if (pairs.isEmpty) {
+        println("No enabled album pairs found. Share albums with the sync users and give them matching [sync <group>] annotations.")
+      } else {
+        checkPeerVersions(peers, api, safety, requiredEnv)
+
+        val peerById = peers.map(peer => peer.id -> peer).toMap
+        parMap(pairs, pairConcurrency) { pair =>
+          val leftPeer = peerById.getOrElse(
+            pair.leftPeerId,
+            throw new RuntimeException(s"Pair '${pair.name}' references missing left peer id ${pair.leftPeerId}")
+          )
+          val rightPeer = peerById.getOrElse(
+            pair.rightPeerId,
+            throw new RuntimeException(s"Pair '${pair.name}' references missing right peer id ${pair.rightPeerId}")
+          )
+
+          try {
+            executePairSync(
+              db = db,
+              api = api,
+              pair = pair,
+              leftPeer = leftPeer,
+              rightPeer = rightPeer,
+              safety = safety,
+              applyWrites = applyWrites,
+              thresholds = thresholds,
+              transferConcurrency = transferConcurrency,
+              retention = retention,
+            )
+            println(s"[pair=${pair.name}] completed")
+          } catch {
+            case NonFatal(e) =>
+              println(s"[pair=${pair.name}] failed: ${Option(e.getMessage).getOrElse(e.toString)}")
+          }
+        }
+
+        // Audit retention: prune old runs (cascades events + leftover observations)
+        // and resolved tombstones. Baseline runs, active tombstones, uploaded_asset
+        // and deletion_log are never touched.
+        val (prunedRuns, prunedTombstones) = transact(db.xa):
+          pruneAuditData(retention.auditRetentionDays)
+        if (prunedRuns > 0 || prunedTombstones > 0) {
+          println(s"[maintenance] pruned $prunedRuns old runs and $prunedTombstones resolved tombstones")
+        }
+      }
 
     cli.rearmPair match {
       case Some(name) =>
@@ -158,57 +229,22 @@ def main(args: String*): Unit =
         }
 
       case None =>
-        runAnnotationDiscovery(db, api, safety, requiredEnv, applyWrites = cli.applyWrites)
-
-        val (peers, pairs) = connect(db.xa):
-          (loadEnabledPeers(), loadEnabledPairs(cli.pairFilter))
-
-        if (cli.discoverOnly) {
-          println(s"Discovery complete. ${pairs.size} enabled pair(s).")
-        } else if (pairs.isEmpty) {
-          println("No enabled album pairs found. Share albums with the sync users and give them matching [sync <group>] annotations.")
-        } else {
-          checkPeerVersions(peers, api, safety, requiredEnv)
-
-          val peerById = peers.map(peer => peer.id -> peer).toMap
-          parMap(pairs, pairConcurrency) { pair =>
-            val leftPeer = peerById.getOrElse(
-              pair.leftPeerId,
-              throw new RuntimeException(s"Pair '${pair.name}' references missing left peer id ${pair.leftPeerId}")
-            )
-            val rightPeer = peerById.getOrElse(
-              pair.rightPeerId,
-              throw new RuntimeException(s"Pair '${pair.name}' references missing right peer id ${pair.rightPeerId}")
-            )
-
-            try {
-              executePairSync(
-                db = db,
-                api = api,
-                pair = pair,
-                leftPeer = leftPeer,
-                rightPeer = rightPeer,
-                safety = safety,
-                applyWrites = cli.applyWrites,
-                thresholds = thresholds,
-                transferConcurrency = transferConcurrency,
-                retention = retention,
-              )
-              println(s"[pair=${pair.name}] completed")
-            } catch {
-              case NonFatal(e) =>
-                println(s"[pair=${pair.name}] failed: ${Option(e.getMessage).getOrElse(e.toString)}")
+        if (!applyWrites) println("[mode] DRY RUN: nothing will be written to any Immich instance or album description")
+        intervalSeconds match {
+          case None =>
+            syncCycle()
+          case Some(seconds) =>
+            // Service mode (e.g. docker compose): reconcile forever on a fixed interval.
+            // A failing cycle is logged and retried on the next tick, never fatal.
+            while (true) {
+              try syncCycle()
+              catch {
+                case NonFatal(e) =>
+                  System.err.println(s"[cycle] failed: ${Option(e.getMessage).getOrElse(e.toString)}")
+              }
+              println(s"[cycle] next run in ${seconds}s")
+              Thread.sleep(seconds * 1000)
             }
-          }
-
-          // Audit retention: prune old runs (cascades events + leftover observations)
-          // and resolved tombstones. Baseline runs, active tombstones, uploaded_asset
-          // and deletion_log are never touched.
-          val (prunedRuns, prunedTombstones) = transact(db.xa):
-            pruneAuditData(retention.auditRetentionDays)
-          if (prunedRuns > 0 || prunedTombstones > 0) {
-            println(s"[maintenance] pruned $prunedRuns old runs and $prunedTombstones resolved tombstones")
-          }
         }
     }
   } finally {
