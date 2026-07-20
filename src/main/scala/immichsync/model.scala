@@ -21,6 +21,7 @@ case class SyncPeer(
   enabled: Boolean,
   maxRemovalCount: Option[Int] = None,
   maxRemovalFraction: Option[Double] = None,
+  cleanupOrphans: Boolean = false,
 )
 
 case class AlbumPair(
@@ -61,6 +62,16 @@ case class RetentionConfig(observationKeepRuns: Int, auditRetentionDays: Int)
 
 object RetentionConfig {
   val Default: RetentionConfig = RetentionConfig(observationKeepRuns = 5, auditRetentionDays = 90)
+}
+
+// Deliberately aggressive defaults (1 day, no cap): a long age gate would relocate
+// risk to a moment nobody is watching (enable flag, surprise bulk pass weeks later),
+// and a cap would smear the same deletions across cycles, reducing observability.
+// Safety lives in the guard stack, not these numbers.
+case class CleanupConfig(afterDays: Int, maxPerPass: Int)
+
+object CleanupConfig {
+  val Default: CleanupConfig = CleanupConfig(afterDays = 1, maxPerPass = 0) // 0 = unlimited
 }
 
 case class DbRuntime(dataSource: HikariDataSource, xa: Transactor)

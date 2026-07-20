@@ -37,6 +37,7 @@ case class PeerConfig(
   enabled: Option[Boolean] = None,
   maxRemovalCount: Option[Int] = None,
   maxRemovalFraction: Option[Double] = None,
+  cleanupOrphans: Option[Boolean] = None,
 ) derives YamlCodec
 
 case class PairEndpointConfig(peer: String, album: String) derives YamlCodec
@@ -127,6 +128,7 @@ def loadSyncConfigFile(path: String): SyncConfig =
 // The API key is deliberately NOT persisted: it stays in the config file only.
 def upsertPeer(peer: PeerConfig)(using DbTx): Unit =
   val enabled = peer.enabled.getOrElse(true)
+  val cleanupOrphans = peer.cleanupOrphans.getOrElse(false)
   val updated =
     sql"""
         UPDATE sync_peer
@@ -134,13 +136,14 @@ def upsertPeer(peer: PeerConfig)(using DbTx): Unit =
             base_url = ${peer.baseUrl},
             enabled = $enabled,
             max_removal_count = ${peer.maxRemovalCount},
-            max_removal_fraction = ${peer.maxRemovalFraction}
+            max_removal_fraction = ${peer.maxRemovalFraction},
+            cleanup_orphans = $cleanupOrphans
         WHERE LOWER(name) = LOWER(${peer.name})
       """.update.run()
   if (updated == 0) {
     sql"""
-        INSERT INTO sync_peer(name, base_url, enabled, max_removal_count, max_removal_fraction)
-        VALUES (${peer.name}, ${peer.baseUrl}, $enabled, ${peer.maxRemovalCount}, ${peer.maxRemovalFraction})
+        INSERT INTO sync_peer(name, base_url, enabled, max_removal_count, max_removal_fraction, cleanup_orphans)
+        VALUES (${peer.name}, ${peer.baseUrl}, $enabled, ${peer.maxRemovalCount}, ${peer.maxRemovalFraction}, $cleanupOrphans)
       """.update.run()
   }
 

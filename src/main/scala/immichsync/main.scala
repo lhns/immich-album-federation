@@ -67,6 +67,12 @@ def loadRetentionConfig(): RetentionConfig =
     auditRetentionDays = envOrDefault("IMMICH_SYNC_AUDIT_RETENTION_DAYS", RetentionConfig.Default.auditRetentionDays.toString).toInt,
   )
 
+def loadCleanupConfig(): CleanupConfig =
+  CleanupConfig(
+    afterDays = envOrDefault("IMMICH_SYNC_CLEANUP_AFTER_DAYS", CleanupConfig.Default.afterDays.toString).toInt,
+    maxPerPass = envOrDefault("IMMICH_SYNC_CLEANUP_MAX", CleanupConfig.Default.maxPerPass.toString).toInt,
+  )
+
 // "30s" / "15m" / "1h" (whitespace between number and unit is fine), or a plain
 // number of seconds. Empty/absent = run once and exit.
 def parseIntervalSeconds(raw: String): Option[Long] =
@@ -120,6 +126,7 @@ def main(args: String*): Unit =
   val cli = parseArgs(args.toArray)
   val thresholds = loadThresholds()
   val retention = loadRetentionConfig()
+  val cleanupConfig = loadCleanupConfig()
   val pairConcurrency = envOrDefault("IMMICH_SYNC_PAIR_CONCURRENCY", "2").toInt
   val transferConcurrency = envOrDefault("IMMICH_SYNC_TRANSFER_CONCURRENCY", "3").toInt
   // The tool applies by default; DRY_RUN=true (or --dry-run) previews without writing.
@@ -231,6 +238,10 @@ def main(args: String*): Unit =
             println(s"[maintenance] pruned $prunedRuns old runs and $prunedTombstones resolved tombstones")
           }
         }
+      }
+
+      if (!cli.discoverOnly) {
+        runOrphanCleanup(db, api, peers, resolveApiKey, applyWrites, cleanupConfig)
       }
 
     if (cli.rearmPairs.nonEmpty) {

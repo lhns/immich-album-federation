@@ -401,6 +401,54 @@ class DbRepositorySuite extends munit.FunSuite:
     }
   }
 
+  test("orphan cleanup end-to-end: trashes only true orphans, logs, respects dry-run and quarantine") {
+    withDb { db =>
+      applySyncConfig(db, SyncConfig(peers = List(leftPeerCfg.copy(cleanupOrphans = Some(true)), rightPeerCfg)))
+      val peers = connect(db.xa)(loadEnabledPeers())
+      val peer = peers.find(_.name == "left").get
+      assert(peer.cleanupOrphans)
+      val pair = seedAnnotationPair(db, peer, peers.find(_.name == "right").get)
+
+      val api = FakeImmichApi()
+      // One visible album containing a live photo still that references a video.
+      val still = mkAsset("still-1", "chk-still").copy(livePhotoVideoId = Some("video-1"))
+      api.setAlbumList(peer.baseUrl, Seq(AlbumSummary("album-left", "L", "[sync grp]")))
+      api.setAlbumAssets(peer.baseUrl, "album-left", Seq(still))
+
+      // Provenance: the still and its video (both protected), a favorited orphan
+      // (protected), and a true orphan.
+      val repo = DbSyncRepository(db)
+      val seedRun = repo.startRun(pair.id, dryRun = false)
+      Seq("still-1" -> "chk-still", "video-1" -> "chk-video", "fav-1" -> "chk-fav", "orphan-1" -> "chk-orphan")
+        .foreach((id, chk) => repo.recordUploadedAsset(seedRun, pair.id, peer.id, id, chk))
+      repo.completeRun(seedRun, "success", None)
+      transact(db.xa):
+        sql"UPDATE uploaded_asset SET created_at = TIMESTAMP WITH TIME ZONE '2020-01-01 00:00:00+00'".update.run()
+      api.setAssetInfo(mkAsset("fav-1", "chk-fav").copy(isFavorite = true))
+      api.setAssetInfo(mkAsset("orphan-1", "chk-orphan"))
+
+      val cleanup = CleanupConfig(afterDays = 1, maxPerPass = 0)
+
+      // Dry run: full preview, zero writes.
+      runOrphanCleanup(db, api, peers, _ => "k", applyWrites = false, cleanup)
+      assert(api.trashCalls.isEmpty)
+      assertEquals(connect(db.xa)(sql"SELECT COUNT(*) FROM deletion_log".query[Long].run().head), 0L)
+
+      // Apply: only the true orphan is trashed and logged.
+      runOrphanCleanup(db, api, peers, _ => "k", applyWrites = true, cleanup)
+      assertEquals(api.trashCalls.map(_._2).flatten.toList, List("orphan-1"))
+      val logged = connect(db.xa):
+        sql"SELECT asset_id, action, run_id FROM deletion_log".query[(String, String, Option[Long])].run()
+      assertEquals(logged, Vector(("orphan-1", "cleanup_trash", None)))
+
+      // Quarantined pair on the peer freezes cleanup entirely.
+      transact(db.xa):
+        sql"UPDATE album_pair SET quarantined_at = now() WHERE id = ${pair.id}".update.run()
+      runOrphanCleanup(db, api, peers, _ => "k", applyWrites = true, cleanup)
+      assertEquals(api.trashCalls.size, 1) // unchanged
+    }
+  }
+
   test("abandoned running runs are marked aborted at startup and become prunable") {
     withDb { db =>
       val (leftPeer, rightPeer) = seedPeers(db)

@@ -14,6 +14,7 @@ peers:
     # enabled: false           # server-level pause: skips all this peer's pairs
     # maxRemovalCount: 25      # per-server circuit-breaker overrides
     # maxRemovalFraction: 0.3
+    # cleanupOrphans: true     # trash tool-uploaded assets no album references (README)
   - name: beta
     baseUrl: https://immich.example.org
     apiKey: replace_me

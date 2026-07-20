@@ -153,23 +153,23 @@ def runMigrations(db: DbRuntime): Unit =
 // NOTE: magnum 1.3.1 cannot splice SQL fragments (an interpolated Frag becomes a bind
 // parameter), so the column lists below are repeated literally; the row mapping is the
 // single source of truth. Keep the SELECT lists in sync with PeerRow / PairRow.
-private[immichsync] type PeerRow = (Long, String, String, Boolean, Option[Int], Option[Double])
+private[immichsync] type PeerRow = (Long, String, String, Boolean, Option[Int], Option[Double], Boolean)
 
 private[immichsync] def peerFromRow(row: PeerRow): SyncPeer = row match {
-  case (id, name, baseUrl, enabled, maxRemovalCount, maxRemovalFraction) =>
-    SyncPeer(id, name, baseUrl, enabled, maxRemovalCount, maxRemovalFraction)
+  case (id, name, baseUrl, enabled, maxRemovalCount, maxRemovalFraction, cleanupOrphans) =>
+    SyncPeer(id, name, baseUrl, enabled, maxRemovalCount, maxRemovalFraction, cleanupOrphans)
 }
 
 def loadEnabledPeers()(using DbCon): Vector[SyncPeer] =
   sql"""
-      SELECT id, name, base_url, enabled, max_removal_count, max_removal_fraction
+      SELECT id, name, base_url, enabled, max_removal_count, max_removal_fraction, cleanup_orphans
       FROM sync_peer
       WHERE enabled = true
     """.query[PeerRow].run().map(peerFromRow)
 
 def loadAllPeers()(using DbCon): Vector[SyncPeer] =
   sql"""
-      SELECT id, name, base_url, enabled, max_removal_count, max_removal_fraction
+      SELECT id, name, base_url, enabled, max_removal_count, max_removal_fraction, cleanup_orphans
       FROM sync_peer
     """.query[PeerRow].run().map(peerFromRow)
 
@@ -423,6 +423,15 @@ def markAbandonedRuns()(using DbTx): Int =
           finished_at = now()
       WHERE status = 'running'
     """.update.run()
+
+def existsQuarantinedPairForPeer(peerId: Long)(using DbCon): Boolean =
+  sql"""
+      SELECT EXISTS(
+        SELECT 1 FROM album_pair
+        WHERE quarantined_at IS NOT NULL
+        AND (left_peer_id = $peerId OR right_peer_id = $peerId)
+      )
+    """.query[Boolean].run().head
 
 def selectQuarantinedPairs()(using DbCon): Vector[(String, Option[String], Option[String])] =
   sql"""

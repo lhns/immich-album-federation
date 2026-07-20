@@ -190,6 +190,29 @@ their own album. Such removals are skipped with a `removal_skipped` event and a
 warning, and the photo is protected from being copied back to the side that deleted it
 (the tombstone stays active).
 
+### Cleaning up the sync user's library
+
+Deleting or unlinking an album never destroys assets — the tool's uploaded copies stay
+in the sync user's library as orphans. The opt-in cleanup pass reclaims them: set
+`cleanupOrphans: true` on a peer in `sync.yaml` and each cycle trashes assets that pass
+**every** guard:
+
+- uploaded by this tool (`uploaded_asset` provenance) — user content is structurally
+  out of scope;
+- uploaded more than `IMMICH_SYNC_CLEANUP_AFTER_DAYS` ago (default 1 — deliberately
+  short: cleanup should act while you're watching it, not surprise you weeks after
+  enabling the flag);
+- currently in **no** album (checked against a live scan of all visible albums and
+  per-asset), not favorited, not archived, not already trashed;
+- not the motion video of any album-resident live photo;
+- the peer has no quarantined pair (frozen state stays frozen).
+
+Trash only, never hard delete; every action is recorded in `deletion_log` as
+`cleanup_trash`; `DRY_RUN=true` previews the pass. Extra net: if a still-wanted asset
+is ever trashed, the next sync cycle finds its checksum in the trash and restores it
+automatically. `IMMICH_SYNC_CLEANUP_MAX` caps a single pass (default 0 = unlimited,
+oldest first).
+
 ### Safety rails
 
 - **Preview mode on demand**: `DRY_RUN=true` (or `--dry-run`) logs every planned action
