@@ -24,8 +24,10 @@ peers:
 
 # Optional. The primary way to link albums is the [sync <group>] annotation:
 # share each album with its instance's sync user, let the tool stamp it with a
-# generated group id, and copy one id to the partner album(s). Manual pairs
-# declared here are for cases where you don't want to touch descriptions.
+# generated group id, and copy one id to the partner album(s). Annotations can
+# restrict who may join: [sync <id> peers=beta owners=alice@example.org].
+# Manual pairs declared here are for cases where you don't want to touch
+# descriptions.
 pairs:
   - name: family
     left: { peer: alpha, album: aaaaaaaa-1111-2222-3333-444444444444 }

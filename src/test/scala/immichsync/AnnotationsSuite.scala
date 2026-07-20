@@ -5,8 +5,8 @@ class AnnotationsSuite extends munit.FunSuite:
   private val peerTwo = SyncPeer(2L, "two", "http://two.local", enabled = true)
   private val peers = Seq(peerOne, peerTwo)
 
-  private def album(id: String, name: String, description: String): AlbumSummary =
-    AlbumSummary(id, name, description)
+  private def album(id: String, name: String, description: String, ownerEmail: Option[String] = None): AlbumSummary =
+    AlbumSummary(id, name, description, ownerEmail)
 
   private def tokenGen(prefix: String): () => String =
     var counter = 0
@@ -25,6 +25,17 @@ class AnnotationsSuite extends munit.FunSuite:
   test("parser: options are parsed") {
     val parsed = parseSyncAnnotations("[sync family deletes=off direction=push]")
     assertEquals(parsed.annotations, Seq(SyncAnnotation("family", Some(false), Some("push"))))
+  }
+
+  test("parser: peers= and owners= allow-lists, lowercased, combinable") {
+    val parsed = parseSyncAnnotations("[sync family peers=Beta,GAMMA owners=Alice@Example.org deletes=off]")
+    assertEquals(
+      parsed.annotations,
+      Seq(SyncAnnotation("family", Some(false), None, Some(Set("beta", "gamma")), Some(Set("alice@example.org")))),
+    )
+    // Empty lists are invalid, not "allow nothing silently".
+    assert(parseSyncAnnotations("[sync family peers=,]").annotations.isEmpty)
+    assertEquals(parseSyncAnnotations("[sync family peers=,]").warnings.size, 1)
   }
 
   test("parser: invalid option drops the annotation with a warning") {
@@ -154,6 +165,57 @@ class AnnotationsSuite extends munit.FunSuite:
     ))
     assertEquals(plan.links.size, 1)
     assert(plan.warnings.exists(_.contains("using the first")))
+  }
+
+  test("discovery: peers= restricts which instances may join, both directions") {
+    def links(descA: String, descB: String) =
+      planDiscovery(peers, Map(
+        1L -> Seq(album("album-a", "A", descA)),
+        2L -> Seq(album("album-b", "B", descB)),
+      )).links
+
+    // Partner's peer listed: linked.
+    assertEquals(links("[sync g-1 peers=two]", "[sync g-1]").size, 1)
+    // Partner's peer not listed: blocked, even though the partner has no restriction.
+    assertEquals(links("[sync g-1 peers=other]", "[sync g-1]").size, 0)
+    // Restriction on the other side blocks just the same.
+    assertEquals(links("[sync g-1]", "[sync g-1 peers=other]").size, 0)
+    // Same-instance pair requires the shared peer's own name when restricted.
+    val samePeer = planDiscovery(peers, Map(
+      1L -> Seq(album("album-a", "A", "[sync g-1 peers=one]"), album("album-b", "B", "[sync g-1]")),
+      2L -> Seq.empty,
+    ))
+    assertEquals(samePeer.links.size, 1)
+  }
+
+  test("discovery: owners= restricts by partner album owner and fails closed") {
+    def plan(descA: String, ownerB: Option[String]) =
+      planDiscovery(peers, Map(
+        1L -> Seq(album("album-a", "A", descA, ownerEmail = Some("me@a.example"))),
+        2L -> Seq(album("album-b", "B", "[sync g-1]", ownerEmail = ownerB)),
+      ))
+
+    assertEquals(plan("[sync g-1 owners=friend@b.example]", Some("Friend@B.example")).links.size, 1)
+    val blocked = plan("[sync g-1 owners=friend@b.example]", Some("mallory@b.example"))
+    assertEquals(blocked.links.size, 0)
+    assert(blocked.warnings.exists(_.contains("does not allow owner 'mallory@b.example'")))
+    // Unknown partner owner + owners= present: blocked, never silently allowed.
+    val unknown = plan("[sync g-1 owners=friend@b.example]", None)
+    assertEquals(unknown.links.size, 0)
+    assert(unknown.warnings.exists(_.contains("owner of album-b is unknown")))
+  }
+
+  test("discovery: restrictions prune only the affected edges of a group") {
+    val plan = planDiscovery(peers, Map(
+      1L -> Seq(album("album-a", "A", "[sync trip peers=one]"), album("album-c", "C", "[sync trip]")),
+      2L -> Seq(album("album-b", "B", "[sync trip]")),
+    ))
+    // A only allows its own instance: A-C links, A-B is blocked, B-C links.
+    assertEquals(
+      plan.links.map(l => ((l.leftPeerId, l.leftAlbumId), (l.rightPeerId, l.rightAlbumId))).toSet,
+      Set(((1L, "album-a"), (1L, "album-c")), ((1L, "album-c"), (2L, "album-b"))),
+    )
+    assert(plan.warnings.exists(_.contains("does not allow peer 'two'")))
   }
 
   test("discovery: group tokens are case-insensitive") {

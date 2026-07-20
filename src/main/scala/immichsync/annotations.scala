@@ -25,7 +25,13 @@ import com.augustnagro.magnum.*
 import java.security.SecureRandom
 import scala.collection.mutable
 
-case class SyncAnnotation(group: String, deletes: Option[Boolean], direction: Option[String])
+case class SyncAnnotation(
+  group: String,
+  deletes: Option[Boolean],
+  direction: Option[String],
+  allowedPeers: Option[Set[String]] = None,
+  allowedOwners: Option[Set[String]] = None,
+)
 
 case class ParsedAnnotations(annotations: Seq[SyncAnnotation], warnings: Seq[String])
 
@@ -46,18 +52,24 @@ def parseSyncAnnotations(description: String): ParsedAnnotations =
     val opts = if (optsRaw.isEmpty) Seq.empty else optsRaw.split("\\s+").toSeq
     var deletes: Option[Boolean] = None
     var direction: Option[String] = None
+    var allowedPeers: Option[Set[String]] = None
+    var allowedOwners: Option[Set[String]] = None
     var valid = true
+    def parseSet(value: String): Option[Set[String]] =
+      Some(value.split(',').map(_.trim).filter(_.nonEmpty).toSet).filter(_.nonEmpty)
     opts.foreach { opt =>
       opt.toLowerCase.split("=", 2) match {
         case Array("deletes", "on")                             => deletes = Some(true)
         case Array("deletes", "off")                            => deletes = Some(false)
         case Array("direction", d @ ("push" | "pull" | "both")) => direction = Some(d)
+        case Array("peers", value) if parseSet(value).isDefined  => allowedPeers = parseSet(value)
+        case Array("owners", value) if parseSet(value).isDefined => allowedOwners = parseSet(value)
         case _ =>
           warnings += s"invalid option '$opt' in sync annotation, annotation ignored"
           valid = false
       }
     }
-    if (valid) annotations += SyncAnnotation(group, deletes, direction)
+    if (valid) annotations += SyncAnnotation(group, deletes, direction, allowedPeers, allowedOwners)
   }
   ParsedAnnotations(annotations.toSeq, warnings.toSeq)
 
@@ -89,6 +101,9 @@ case class AlbumMembership(
   group: Option[String],
   deletes: Option[Boolean],
   direction: Option[String],
+  ownerEmail: Option[String] = None,
+  allowedPeers: Option[Set[String]] = None,
+  allowedOwners: Option[Set[String]] = None,
 )
 
 case class AutoAnnotation(peerId: Long, albumId: String, newDescription: String, token: String)
@@ -126,6 +141,13 @@ def planDiscovery(
     albums.foreach { album =>
       val parsed = parseSyncAnnotations(album.description)
       parsed.warnings.foreach(w => warnings += s"peer '$peerName' album '${album.albumName}': $w")
+      def membershipFor(annotation: SyncAnnotation): AlbumMembership =
+        AlbumMembership(
+          peerId, album.id, Some(annotation.group), annotation.deletes, annotation.direction,
+          ownerEmail = album.ownerEmail,
+          allowedPeers = annotation.allowedPeers,
+          allowedOwners = annotation.allowedOwners,
+        )
       parsed.annotations match {
         case Seq() =>
           // Shared with the sync user but not yet annotated: stamp it with a fresh
@@ -136,13 +158,12 @@ def planDiscovery(
             if (album.description.isEmpty) s"[sync $token]"
             else s"${album.description}\n[sync $token]"
           autoAnnotations += AutoAnnotation(peerId, album.id, newDescription, token)
-          memberships += AlbumMembership(peerId, album.id, None, None, None)
+          memberships += AlbumMembership(peerId, album.id, None, None, None, ownerEmail = album.ownerEmail)
         case Seq(annotation) =>
-          memberships += AlbumMembership(peerId, album.id, Some(annotation.group), annotation.deletes, annotation.direction)
+          memberships += membershipFor(annotation)
         case multiple =>
           warnings += s"peer '$peerName' album '${album.albumName}': ${multiple.size} sync annotations found, using the first"
-          val annotation = multiple.head
-          memberships += AlbumMembership(peerId, album.id, Some(annotation.group), annotation.deletes, annotation.direction)
+          memberships += membershipFor(multiple.head)
       }
     }
   }
@@ -156,6 +177,22 @@ def planDiscovery(
     } else {
       def sends(direction: String) = direction == "push" || direction == "both"
       def receives(direction: String) = direction == "pull" || direction == "both"
+      // Join authorization: every restriction on one side must pass for the other.
+      // owners= fails closed when the partner's owner identity is unavailable.
+      def blockReason(restricted: AlbumMembership, partner: AlbumMembership): Option[String] =
+        val partnerPeer = peerNameById.get(partner.peerId).map(_.toLowerCase)
+        if (restricted.allowedPeers.exists(allowed => !partnerPeer.exists(allowed.contains)))
+          Some(s"${restricted.albumId} does not allow peer '${partnerPeer.getOrElse(partner.peerId.toString)}'")
+        else restricted.allowedOwners match {
+          case None => None
+          case Some(allowed) =>
+            partner.ownerEmail match {
+              case None => Some(s"${restricted.albumId} requires owners= but the owner of ${partner.albumId} is unknown")
+              case Some(email) if !allowed.contains(email.toLowerCase) =>
+                Some(s"${restricted.albumId} does not allow owner '$email'")
+              case _ => None
+            }
+        }
       for {
         i <- members.indices
         j <- (i + 1) until members.size
@@ -166,7 +203,10 @@ def planDiscovery(
         val dirB = b.direction.getOrElse("both")
         val flowAtoB = sends(dirA) && receives(dirB)
         val flowBtoA = sends(dirB) && receives(dirA)
-        if (!flowAtoB && !flowBtoA) {
+        val blocked = blockReason(a, b).orElse(blockReason(b, a))
+        if (blocked.isDefined) {
+          warnings += s"group '$token': ${blocked.get}, not linked"
+        } else if (!flowAtoB && !flowBtoA) {
           warnings += s"group '$token': contradictory directions between ${a.albumId} and ${b.albumId} (no enabled flow), not linked"
         } else {
           val mode =

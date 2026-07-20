@@ -145,16 +145,34 @@ Note on same-instance groups (two albums on one server): Immich deduplicates con
 per *user*, so mirrored photos become copies owned by the sync user — it works, but
 budgets the sync user's quota accordingly.
 
-Options inside the annotation (defaults: `deletes=on`, `direction=both`):
+Options inside the annotation (defaults: `deletes=on`, `direction=both`, no join
+restrictions):
 
 ```
-[sync family deletes=off direction=push]
+[sync family deletes=off direction=push peers=beta owners=alice@example.org]
 ```
 
 - `deletes=on|off` — mirror album-membership removals. On by default; **either**
   member saying `off` disables propagation for that pairing.
 - `direction=push|pull|both` — relative to the annotating album: `push` = my content
   flows out only, `pull` = I only receive.
+- `peers=<name>,...` — only albums on the named instances may pair with this album.
+- `owners=<email>,...` — only albums owned by these users may pair with this album
+  (fails closed if a partner's owner cannot be determined).
+
+### Who can join a group
+
+The group token is a join credential: anyone who can read it (album viewers see
+descriptions) or guess it can attach their own album — on any connected instance — and
+sync with yours. Keep that in mind:
+
+- Generated tokens are unguessable; hand-picked names like `family` are not. Use the
+  generated ones for anything sensitive.
+- For strict control, add `peers=` (which instances may join) and/or `owners=` (which
+  users' albums may join) to your annotation. Both sides' restrictions must pass for a
+  link to form; blocked joins are logged.
+- A leaked token is revoked by rotating it: put a fresh generated token on all
+  legitimate members; the pairs re-link additively.
 
 Removing the annotation or unsharing the album unlinks it (the pair is disabled, all
 history kept; a still-shared album simply gets a fresh unlinked id on the next run).

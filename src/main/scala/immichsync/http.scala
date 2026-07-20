@@ -49,10 +49,22 @@ class LiveImmichApi(backend: SyncBackend) extends ImmichApi:
       // v3: unfiltered listing returns owned + shared-with-me albums. For a dedicated
       // sync user that is exactly the opt-in set.
       sendJson(base(server).get(uri"${server.apiBaseUrl}/albums"), "list albums").arr.map { album =>
+        // v3: the owner is the albumUsers entry with role "owner" (documented to be
+        // first); exposed for owners= join restrictions. Defensive: absent -> None.
+        val ownerEmail = album.obj.get("albumUsers").flatMap(_.arrOpt).flatMap { users =>
+          users
+            .find(_.obj.get("role").flatMap(_.strOpt).contains("owner"))
+            .flatMap(_.obj.get("user"))
+            .flatMap(_.obj.get("email"))
+            .flatMap(_.strOpt)
+            .map(_.toLowerCase)
+            .filter(_.nonEmpty)
+        }
         AlbumSummary(
           id = album("id").str,
           albumName = album("albumName").str,
           description = album.obj.get("description").flatMap(_.strOpt).getOrElse(""),
+          ownerEmail = ownerEmail,
         )
       }.toSeq
     }

@@ -10,7 +10,12 @@ case class ImmichServer(baseUrl: String, apiKey: String) {
 
 case class Album(server: ImmichServer, id: String)
 
-case class AlbumSummary(id: String, albumName: String, description: String)
+case class AlbumSummary(
+  id: String,
+  albumName: String,
+  description: String,
+  ownerEmail: Option[String] = None,
+)
 
 // API keys are not part of the peer row: they live only in the config file and are
 // resolved in memory per run (never persisted to the database).
